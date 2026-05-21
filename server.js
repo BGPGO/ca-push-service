@@ -366,19 +366,21 @@ function crmRequest(method, path, body) {
   });
 }
 
-function finhubFunction(fname, body) {
+function finhubRest(method, path, body) {
   return new Promise((resolve, reject) => {
-    const u = new URL(`${FINHUB_SUPABASE_URL}/functions/v1/${fname}`);
-    const data = Buffer.from(JSON.stringify(body));
+    const u = new URL(`${FINHUB_SUPABASE_URL}/rest/v1${path}`);
+    const data = body ? Buffer.from(JSON.stringify(body)) : null;
     const opts = {
-      hostname: u.hostname, path: u.pathname, method: 'POST',
+      hostname: u.hostname, path: u.pathname + (u.search || ''), method,
       headers: {
         'apikey': FINHUB_SERVICE_KEY,
         'Authorization': `Bearer ${FINHUB_SERVICE_KEY}`,
         'Content-Type': 'application/json',
-        'Content-Length': data.length,
+        'Accept': 'application/json',
+        'Prefer': method === 'POST' || method === 'PATCH' ? 'return=representation' : '',
       },
     };
+    if (data) opts.headers['Content-Length'] = data.length;
     const req = https.request(opts, res => {
       const chunks = []; res.on('data', c => chunks.push(c));
       res.on('end', () => {
@@ -388,8 +390,43 @@ function finhubFunction(fname, body) {
       });
     });
     req.on('error', reject);
-    req.write(data); req.end();
+    if (data) req.write(data); req.end();
   });
+}
+
+// Cria cliente no FinHub direto via REST (service_role bypassa RLS).
+// Pula edge function create-client porque ela exige JWT de user 'team'.
+async function finhubCreateClient(payload) {
+  // 1) Dedup por CNPJ
+  const cnpj = (payload.cnpj || '').replace(/\D/g, '');
+  if (cnpj) {
+    const dup = await finhubRest('GET', `/clients?cnpj=eq.${cnpj}&select=id,name&limit=1`);
+    if (dup.status === 200 && Array.isArray(dup.body) && dup.body.length > 0) {
+      return { reused: true, id: dup.body[0].id, name: dup.body[0].name };
+    }
+  }
+  // 2) INSERT
+  const now = new Date().toISOString();
+  const row = {
+    name: payload.name,
+    company: payload.company || payload.name,
+    email: payload.email || null,
+    phone: payload.phone || null,
+    cnpj: cnpj || null,
+    status: 'ativo',
+    data_entrada: now.slice(0, 10),
+    conta_azul_code: payload.conta_azul_code || null,
+    erp_cliente: payload.erp_cliente || 'contaazul',
+    observacoes_importantes: payload.observacoes || null,
+    created_at: now,
+    updated_at: now,
+  };
+  const r = await finhubRest('POST', '/clients', row);
+  if (r.status !== 201 && r.status !== 200) {
+    throw new Error(`finhub insert clients falhou ${r.status}: ${JSON.stringify(r.body).slice(0,300)}`);
+  }
+  const created = Array.isArray(r.body) ? r.body[0] : r.body;
+  return { reused: false, id: created.id, name: created.name };
 }
 
 // ---------- SCAN logic ----------
@@ -463,24 +500,20 @@ async function scanAndProcessTest() {
         out.ca_skip_reason = 'customer_already_exists_in_ca';
       }
 
-      // 3b) Push to FinHub (optional)
+      // 3b) Push to FinHub (insert direto em clients, bypassa edge function)
       if (FINHUB_SERVICE_KEY) {
         try {
-          const finResp = await finhubFunction('create-client', {
-            clientData: {
-              name: c.razaoSocial,
-              company: c.razaoSocial,
-              email: c.emailFinanceiro || c.emailRepresentante,
-              phone: contact.phone || org.phone || '',
-              cnpj,
-              senha_cliente: 'TempPass' + Math.random().toString(36).slice(-8) + '!',
-              risco: 'baixo',
-              status: 'ativo',
-              data_entrada: new Date().toISOString().slice(0, 10),
-              observacoes_importantes: `[TEST E2E PIPELINE] Auto-criado via ca-push-service. CRM Contract id=${c.id}`,
-            },
+          const fin = await finhubCreateClient({
+            name: c.razaoSocial,
+            company: c.razaoSocial,
+            email: c.emailFinanceiro || c.emailRepresentante,
+            phone: contact.phone || org.phone || '',
+            cnpj,
+            conta_azul_code: out.ca_customer?.id || null,
+            erp_cliente: 'contaazul',
+            observacoes: `[TEST E2E PIPELINE] CRM Contract=${c.id} | Deal=${c.deal?.id} | CA customer=${out.ca_customer?.id || '?'} | CA scheduled-sale=${out.ca_scheduledSale?.id || '?'}`,
           });
-          out.finhub = { status: finResp.status, body: finResp.body };
+          out.finhub = fin;
         } catch (e) {
           out.finhub_error = e.message;
         }
