@@ -619,50 +619,14 @@ async function scanAndProcessTest(opts = {}) {
         }, { testMode: true });
       }
 
-      // 3.5) Aplica desconto nas N primeiras parcelas (idempotente)
+      // 3.5/4) Discount e Setup desativados no scan automático até dedup estar 100% estável.
+      // Usuário aplica via endpoints dedicados POST /apply-discount e POST /apply-setup.
+      // Marcadores informativos:
       if (Number(c.descontoMeses) > 0 && Number(c.descontoPercentual) > 0) {
-        try {
-          out.ca_discounts = await applyDiscountToFirstN(
-            out.ca_scheduledSale.id,
-            Number(c.descontoMeses),
-            Number(c.descontoPercentual),
-            Number(c.valorMensal),
-            c.razaoSocial || ''
-          );
-        } catch (e) {
-          out.ca_discount_error = e.message;
-        }
+        out.ca_discount_pending = `Aplicar desconto ${c.descontoPercentual}% nas ${c.descontoMeses} primeiras parcelas (use POST /apply-discount/${out.ca_scheduledSale.id})`;
       }
-
-      // 4) Setup avulso (idempotência: skip se ja existe sale avulsa com o mesmo valor pro customer)
       if (Number(c.valorImplementacao) > 0) {
-        try {
-          // Procura venda avulsa pelo customer e mesmo valor (search paginado, filtra por nome)
-          let existingAvulsa = null;
-          for (let page = 1; page <= 5 && !existingAvulsa; page++) {
-            const sr = await caRequest('POST', `/contaazul-bff/sale/v1/sales/searches?page=${page}&page_size=50`, { searchTerm: c.razaoSocial || '' });
-            const items = sr.body?.items || [];
-            if (items.length === 0) break;
-            existingAvulsa = items.find(it =>
-              it.type === 'SALE' &&
-              it.customer?.id === out.ca_customer.id &&
-              Math.abs((it.paymentCondition?.installments?.[0]?.value || 0) - Number(c.valorImplementacao)) < 0.01
-            );
-            if (items.length < 50) break;
-          }
-          if (existingAvulsa) {
-            out.ca_setupSale = { id: existingAvulsa.id, legacyId: existingAvulsa.legacyId, reused: true };
-          } else {
-            out.ca_setupSale = await createSetupSale(out.ca_customer.id, {
-              produto: c.produto,
-              valorImplementacao: Number(c.valorImplementacao),
-              dataAssinatura: c.autentiqueSignedAt || c.dataInicio || new Date().toISOString(),
-              sellerEmail: c.deal?.user?.email,
-            }, { testMode: true });
-          }
-        } catch (e) {
-          out.ca_setupSale_error = e.message;
-        }
+        out.ca_setup_pending = `Criar setup avulso R$ ${c.valorImplementacao} (use POST /apply-setup/${out.ca_customer.id})`;
       }
 
       // 3b) Push to FinHub (insert direto em clients, bypassa edge function)
