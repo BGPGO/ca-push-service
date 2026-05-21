@@ -210,10 +210,14 @@ function firstDueAfter(emissionDate, dueDay) {
   return d.toISOString().slice(0, 10);
 }
 
+function normalizeProductKey(s) {
+  return String(s || '').toLowerCase().trim().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+}
+
 async function createScheduledSale(customerId, contract, opts) {
-  const productKey = (contract.produto || '').toLowerCase().trim();
+  const productKey = normalizeProductKey(contract.produto);
   const map = PRODUCT_MAP[productKey];
-  if (!map) throw new Error(`Produto desconhecido: '${contract.produto}'. Conhecidos: ${Object.keys(PRODUCT_MAP).join(', ')}`);
+  if (!map) throw new Error(`Produto desconhecido: '${contract.produto}' (normalizado: '${productKey}'). Conhecidos: ${Object.keys(PRODUCT_MAP).join(', ')}`);
 
   const sellerId = SELLER_MAP[(contract.sellerEmail || '').toLowerCase()] || DEFAULTS.sellerId;
   const valor = Number(contract.valorMensal);
@@ -292,9 +296,9 @@ async function createSetupSale(customerId, contract, opts) {
   const valor = Number(contract.valorImplementacao);
   if (!valor || valor <= 0) return null;
 
-  const productKey = (contract.produto || '').toLowerCase().trim();
+  const productKey = normalizeProductKey(contract.produto);
   const map = PRODUCT_MAP[productKey];
-  if (!map) throw new Error(`Produto desconhecido: '${contract.produto}'`);
+  if (!map) throw new Error(`Produto desconhecido: '${contract.produto}' (normalizado: '${productKey}')`);
 
   const sellerId = SELLER_MAP[(contract.sellerEmail || '').toLowerCase()] || DEFAULTS.sellerId;
   const tax = await calcTaxes(valor);
@@ -502,7 +506,7 @@ async function scanAndProcessTest(opts = {}) {
         out.ca_setupSale = await createSetupSale(out.ca_customer.id, {
           produto: c.produto,
           valorImplementacao: Number(c.valorImplementacao),
-          dataAssinatura: c.autentiqueSignedAt || c.dataInicio,
+          dataAssinatura: c.autentiqueSignedAt || c.dataInicio || new Date().toISOString(),
           sellerEmail: c.deal?.user?.email,
         }, { testMode: true });
       }
