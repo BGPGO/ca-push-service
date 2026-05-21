@@ -308,9 +308,9 @@ async function createSetupSale(customerId, contract, opts) {
   const tax = await calcTaxes(valor);
   const committedDate = String(contract.dataAssinatura).slice(0, 10);
 
-  // /sales tem proprio next-number sequencial
-  const nn = await caRequest('GET', '/app/v1/sales/next-number');
-  const saleNumber = (nn.body && nn.body.number) || null;
+  // Venda avulsa usa /negotiations/next-number — response shape: {"data": N}
+  const nn = await caRequest('GET', '/app/v1/negotiations/next-number');
+  const saleNumber = nn.body && (nn.body.data || nn.body.number) || null;
 
   const body = {
     customerId,
@@ -510,14 +510,18 @@ async function scanAndProcessTest(opts = {}) {
         sellerEmail: c.deal?.user?.email,
       }, { testMode: true });
 
-      // 4) Setup avulso se houver
+      // 4) Setup avulso se houver — não bloqueia se falhar
       if (Number(c.valorImplementacao) > 0) {
-        out.ca_setupSale = await createSetupSale(out.ca_customer.id, {
-          produto: c.produto,
-          valorImplementacao: Number(c.valorImplementacao),
-          dataAssinatura: c.autentiqueSignedAt || c.dataInicio || new Date().toISOString(),
-          sellerEmail: c.deal?.user?.email,
-        }, { testMode: true });
+        try {
+          out.ca_setupSale = await createSetupSale(out.ca_customer.id, {
+            produto: c.produto,
+            valorImplementacao: Number(c.valorImplementacao),
+            dataAssinatura: c.autentiqueSignedAt || c.dataInicio || new Date().toISOString(),
+            sellerEmail: c.deal?.user?.email,
+          }, { testMode: true });
+        } catch (e) {
+          out.ca_setupSale_error = e.message;
+        }
       }
 
       // 3b) Push to FinHub (insert direto em clients, bypassa edge function)
