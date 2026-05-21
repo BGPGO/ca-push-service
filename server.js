@@ -227,7 +227,21 @@ async function findScheduledSaleByCustomer(customerId, searchTerm = '') {
   return null;
 }
 
-const SERVICE_VERSION = '2026-05-21T20:35:00Z-discount-v3';
+const SERVICE_VERSION = '2026-05-21T20:50:00Z-finhub-complete';
+
+// Mapeamento produto BGP CRM -> FinHub products table (id + display_name)
+const FINHUB_PRODUCT_MAP = {
+  'bgp-bi':              { id: '5c9e70ed-6674-4847-b8ac-b319c2307eb7', name: 'BI' },
+  'bi-personalizado':    { id: '4c64b935-cd59-4da2-925d-1a48d9d5b1ec', name: 'BI2B' },
+  'bgp-bi-personalizado':{ id: '4c64b935-cd59-4da2-925d-1a48d9d5b1ec', name: 'BI2B' },
+  'bgp-go-i':            { id: '5bccd167-c426-48c7-aa30-3045fc5b0c65', name: 'GO I' },
+  'bgp-go-ii':           { id: '0f1e9c35-9499-4262-bdf8-e8a3fa403c5b', name: 'GO II' },
+  'bgp-go-iii':          { id: 'a5ed83f4-e9fe-4eb7-bf73-e4762041a97b', name: 'GO III' },
+  'bgp-strategy':        { id: '2836916d-1e83-42f9-8dcc-35fe8977ac87', name: 'Strategy' },
+  'bgp-valuation':       { id: 'b0d4e7dd-2d88-43a3-9cbc-50eb3996e4a3', name: 'Valuation' },
+  'brand-growth':        { id: '08a5e33e-6bb0-477e-aa7b-d6323260e997', name: 'Brand Growth' },
+  'go-aimo':             { id: '9b45dc42-d30b-4135-8406-82f02d0a1d7e', name: 'GO BI by AiMO' },
+};
 
 // Aplica desconto nas N primeiras parcelas geradas (idempotente — pode rodar várias vezes sem duplicar efeito)
 async function applyDiscountToFirstN(schedId, descontoMeses, descontoPercentual, valorMensal, searchTerm = '') {
@@ -523,37 +537,92 @@ function finhubRest(method, path, body) {
 
 // Cria cliente no FinHub direto via REST (service_role bypassa RLS).
 // Pula edge function create-client porque ela exige JWT de user 'team'.
+// Cria: clients + client_products + pit_wall (mesmo padrão da create-client edge fn).
 async function finhubCreateClient(payload) {
-  // 1) Dedup por CNPJ
   const cnpj = (payload.cnpj || '').replace(/\D/g, '');
-  if (cnpj) {
-    const dup = await finhubRest('GET', `/clients?cnpj=eq.${cnpj}&select=id,name&limit=1`);
-    if (dup.status === 200 && Array.isArray(dup.body) && dup.body.length > 0) {
-      return { reused: true, id: dup.body[0].id, name: dup.body[0].name };
+  if (!cnpj) throw new Error('CNPJ obrigatório pra criar cliente FinHub');
+
+  // 1) Dedup clients por CNPJ
+  const dup = await finhubRest('GET', `/clients?cnpj=eq.${cnpj}&select=id,name&limit=1`);
+  let clientId, clientName, reused = false;
+  if (dup.status === 200 && Array.isArray(dup.body) && dup.body.length > 0) {
+    clientId = dup.body[0].id; clientName = dup.body[0].name; reused = true;
+  } else {
+    // 2) INSERT clients (conta_azul_code = CNPJ, padrão do FinHub)
+    const now = new Date().toISOString();
+    const row = {
+      name: payload.name,
+      company: payload.company || payload.name,
+      email: payload.email || null,
+      phone: payload.phone || null,
+      cnpj,
+      status: 'ativo',
+      data_entrada: now.slice(0, 10),
+      conta_azul_code: cnpj, // ← CNPJ, NÃO o uuid da CA
+      erp_cliente: payload.erp_cliente || 'contaazul',
+      observacoes_importantes: payload.observacoes || null,
+      created_at: now,
+      updated_at: now,
+    };
+    const r = await finhubRest('POST', '/clients', row);
+    if (r.status !== 201 && r.status !== 200) {
+      throw new Error(`finhub insert clients falhou ${r.status}: ${JSON.stringify(r.body).slice(0,300)}`);
+    }
+    const created = Array.isArray(r.body) ? r.body[0] : r.body;
+    clientId = created.id; clientName = created.name;
+  }
+
+  // 3) client_products (idempotente por client_id+product_id)
+  const productKey = normalizeProductKey(payload.produto || '');
+  const productMap = FINHUB_PRODUCT_MAP[productKey];
+  let productRow = null;
+  if (productMap) {
+    const dupP = await finhubRest('GET',
+      `/client_products?client_id=eq.${clientId}&product_id=eq.${productMap.id}&select=id&limit=1`);
+    if (dupP.status === 200 && Array.isArray(dupP.body) && dupP.body.length > 0) {
+      productRow = { id: dupP.body[0].id, reused: true };
+    } else {
+      const cpRow = {
+        client_id: clientId,
+        product_name: productMap.name,
+        product_id: productMap.id,
+        value: payload.valorMensal || null,
+      };
+      const r = await finhubRest('POST', '/client_products', cpRow);
+      if (r.status === 201 || r.status === 200) {
+        const c = Array.isArray(r.body) ? r.body[0] : r.body;
+        productRow = { id: c.id, product_name: c.product_name, reused: false };
+      } else {
+        productRow = { error: `client_products insert ${r.status}: ${JSON.stringify(r.body).slice(0,200)}` };
+      }
+    }
+  } else {
+    productRow = { error: `produto não mapeado: '${payload.produto}'` };
+  }
+
+  // 4) pit_wall (UNIQUE por client_id)
+  let pitWallRow = null;
+  const dupPW = await finhubRest('GET',
+    `/pit_wall?client_id=eq.${clientId}&select=id&limit=1`);
+  if (dupPW.status === 200 && Array.isArray(dupPW.body) && dupPW.body.length > 0) {
+    pitWallRow = { id: dupPW.body[0].id, reused: true };
+  } else {
+    const pwRow = {
+      client_id: clientId,
+      prioridade_pontos_atencao: 'Novo cliente — configurar processos iniciais',
+      status_reuniao_cliente: 'marcar',
+      produto: productMap?.name || null,
+    };
+    const r = await finhubRest('POST', '/pit_wall', pwRow);
+    if (r.status === 201 || r.status === 200) {
+      const p = Array.isArray(r.body) ? r.body[0] : r.body;
+      pitWallRow = { id: p.id, reused: false };
+    } else {
+      pitWallRow = { error: `pit_wall insert ${r.status}: ${JSON.stringify(r.body).slice(0,200)}` };
     }
   }
-  // 2) INSERT
-  const now = new Date().toISOString();
-  const row = {
-    name: payload.name,
-    company: payload.company || payload.name,
-    email: payload.email || null,
-    phone: payload.phone || null,
-    cnpj: cnpj || null,
-    status: 'ativo',
-    data_entrada: now.slice(0, 10),
-    conta_azul_code: payload.conta_azul_code || null,
-    erp_cliente: payload.erp_cliente || 'contaazul',
-    observacoes_importantes: payload.observacoes || null,
-    created_at: now,
-    updated_at: now,
-  };
-  const r = await finhubRest('POST', '/clients', row);
-  if (r.status !== 201 && r.status !== 200) {
-    throw new Error(`finhub insert clients falhou ${r.status}: ${JSON.stringify(r.body).slice(0,300)}`);
-  }
-  const created = Array.isArray(r.body) ? r.body[0] : r.body;
-  return { reused: false, id: created.id, name: created.name };
+
+  return { reused, id: clientId, name: clientName, conta_azul_code: cnpj, client_product: productRow, pit_wall: pitWallRow };
 }
 
 // ---------- SCAN logic ----------
@@ -645,20 +714,20 @@ async function scanAndProcessTest(opts = {}) {
         out.ca_setup_pending = `Criar setup avulso R$ ${c.valorImplementacao} manualmente no painel CA Pro`;
       }
 
-      // 3b) Push to FinHub (insert direto em clients, bypassa edge function)
+      // 3b) Push to FinHub: clients + client_products + pit_wall (idempotente)
       if (FINHUB_SERVICE_KEY) {
         try {
-          const fin = await finhubCreateClient({
+          out.finhub = await finhubCreateClient({
             name: c.razaoSocial,
             company: c.razaoSocial,
             email: c.emailFinanceiro || c.emailRepresentante,
             phone: contact.phone || org.phone || '',
             cnpj,
-            conta_azul_code: out.ca_customer?.id || null,
+            produto: c.produto,
+            valorMensal: Number(c.valorMensal),
             erp_cliente: 'contaazul',
             observacoes: `[TEST E2E PIPELINE] CRM Contract=${c.id} | Deal=${c.deal?.id} | CA customer=${out.ca_customer?.id || '?'} | CA scheduled-sale=${out.ca_scheduledSale?.id || '?'}`,
           });
-          out.finhub = fin;
         } catch (e) {
           out.finhub_error = e.message;
         }
