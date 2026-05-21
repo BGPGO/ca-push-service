@@ -593,24 +593,59 @@ async function scanAndProcessTest(opts = {}) {
         }, { testMode: true });
       }
 
-      // 3) Scheduled-sale: SEMPRE cria (independente se customer foi reused)
-      out.ca_scheduledSale = await createScheduledSale(out.ca_customer.id, {
-        produto: c.produto,
-        valorMensal: Number(c.valorMensal),
-        diaVencimento: Number(c.diaVencimento || 10),
-        dataAssinatura: c.autentiqueSignedAt || c.dataInicio,
-        sellerEmail: c.deal?.user?.email,
-      }, { testMode: true });
+      // 3) Scheduled-sale: dedup por customer (reusa se já existe ativo)
+      const existingSched = await findScheduledSaleByCustomer(out.ca_customer.id, c.razaoSocial || '');
+      if (existingSched) {
+        out.ca_scheduledSale = {
+          id: existingSched.id,
+          legacyId: existingSched.legacyId,
+          number: existingSched.template?.terms?.number,
+          reused: true,
+        };
+      } else {
+        out.ca_scheduledSale = await createScheduledSale(out.ca_customer.id, {
+          produto: c.produto,
+          valorMensal: Number(c.valorMensal),
+          diaVencimento: Number(c.diaVencimento || 10),
+          dataAssinatura: c.autentiqueSignedAt || c.dataInicio || new Date().toISOString(),
+          sellerEmail: c.deal?.user?.email,
+        }, { testMode: true });
+      }
 
-      // 4) Setup avulso se houver — não bloqueia se falhar
+      // 3.5) Aplica desconto nas N primeiras parcelas (idempotente)
+      if (Number(c.descontoMeses) > 0 && Number(c.descontoPercentual) > 0) {
+        try {
+          out.ca_discounts = await applyDiscountToFirstN(
+            out.ca_scheduledSale.id,
+            Number(c.descontoMeses),
+            Number(c.descontoPercentual),
+            Number(c.valorMensal)
+          );
+        } catch (e) {
+          out.ca_discount_error = e.message;
+        }
+      }
+
+      // 4) Setup avulso (idempotência: skip se ja existe sale avulsa com o mesmo valor pro customer)
       if (Number(c.valorImplementacao) > 0) {
         try {
-          out.ca_setupSale = await createSetupSale(out.ca_customer.id, {
-            produto: c.produto,
-            valorImplementacao: Number(c.valorImplementacao),
-            dataAssinatura: c.autentiqueSignedAt || c.dataInicio || new Date().toISOString(),
-            sellerEmail: c.deal?.user?.email,
-          }, { testMode: true });
+          // Procura venda avulsa existente pra mesmo customer e mesmo valor (heuristica)
+          const sr = await caRequest('POST', '/contaazul-bff/sale/v1/sales/searches?page=1&page_size=50', { searchTerm: c.razaoSocial || '' });
+          const existingAvulsa = (sr.body?.items || []).find(it =>
+            it.type === 'SALE' &&
+            it.customer?.id === out.ca_customer.id &&
+            Math.abs((it.paymentCondition?.installments?.[0]?.value || 0) - Number(c.valorImplementacao)) < 0.01
+          );
+          if (existingAvulsa) {
+            out.ca_setupSale = { id: existingAvulsa.id, legacyId: existingAvulsa.legacyId, reused: true };
+          } else {
+            out.ca_setupSale = await createSetupSale(out.ca_customer.id, {
+              produto: c.produto,
+              valorImplementacao: Number(c.valorImplementacao),
+              dataAssinatura: c.autentiqueSignedAt || c.dataInicio || new Date().toISOString(),
+              sellerEmail: c.deal?.user?.email,
+            }, { testMode: true });
+          }
         } catch (e) {
           out.ca_setupSale_error = e.message;
         }
