@@ -228,17 +228,24 @@ async function findScheduledSaleByCustomer(customerId, searchTerm = '') {
 }
 
 // Aplica desconto nas N primeiras parcelas geradas (idempotente — pode rodar várias vezes sem duplicar efeito)
-async function applyDiscountToFirstN(schedId, descontoMeses, descontoPercentual, valorMensal) {
+async function applyDiscountToFirstN(schedId, descontoMeses, descontoPercentual, valorMensal, searchTerm = '') {
   if (!descontoMeses || !descontoPercentual) return [];
   const N = Math.floor(descontoMeses);
   const descontoVal = Math.round((valorMensal * descontoPercentual / 100) * 100) / 100;
   const baseCom = Math.round((valorMensal - descontoVal) * 100) / 100;
 
-  // GET instances (sale instances geradas pelo scheduled-sale)
-  const search = await caRequest('POST', '/contaazul-bff/sale/v1/sales/searches?page=1&page_size=50', { searchTerm: '' });
-  const linked = (search.body?.items || [])
-    .filter(it => it.type === 'SCHEDULED_SALE' && it.schedule?.id === schedId)
-    .sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+  // GET instances filtrando por searchTerm pra trazer só do cliente certo (search global da CA é paginado)
+  const allLinked = [];
+  for (let page = 1; page <= 5; page++) {
+    const search = await caRequest('POST', `/contaazul-bff/sale/v1/sales/searches?page=${page}&page_size=50`, { searchTerm });
+    const items = search.body?.items || [];
+    if (items.length === 0) break;
+    for (const it of items) {
+      if (it.type === 'SCHEDULED_SALE' && it.schedule?.id === schedId) allLinked.push(it);
+    }
+    if (items.length < 50) break;
+  }
+  const linked = allLinked.sort((a, b) => (a.date || '').localeCompare(b.date || ''));
   const targets = linked.slice(0, N);
   if (targets.length === 0) return [];
 
@@ -619,7 +626,8 @@ async function scanAndProcessTest(opts = {}) {
             out.ca_scheduledSale.id,
             Number(c.descontoMeses),
             Number(c.descontoPercentual),
-            Number(c.valorMensal)
+            Number(c.valorMensal),
+            c.razaoSocial || ''
           );
         } catch (e) {
           out.ca_discount_error = e.message;
@@ -629,13 +637,19 @@ async function scanAndProcessTest(opts = {}) {
       // 4) Setup avulso (idempotência: skip se ja existe sale avulsa com o mesmo valor pro customer)
       if (Number(c.valorImplementacao) > 0) {
         try {
-          // Procura venda avulsa existente pra mesmo customer e mesmo valor (heuristica)
-          const sr = await caRequest('POST', '/contaazul-bff/sale/v1/sales/searches?page=1&page_size=50', { searchTerm: c.razaoSocial || '' });
-          const existingAvulsa = (sr.body?.items || []).find(it =>
-            it.type === 'SALE' &&
-            it.customer?.id === out.ca_customer.id &&
-            Math.abs((it.paymentCondition?.installments?.[0]?.value || 0) - Number(c.valorImplementacao)) < 0.01
-          );
+          // Procura venda avulsa pelo customer e mesmo valor (search paginado, filtra por nome)
+          let existingAvulsa = null;
+          for (let page = 1; page <= 5 && !existingAvulsa; page++) {
+            const sr = await caRequest('POST', `/contaazul-bff/sale/v1/sales/searches?page=${page}&page_size=50`, { searchTerm: c.razaoSocial || '' });
+            const items = sr.body?.items || [];
+            if (items.length === 0) break;
+            existingAvulsa = items.find(it =>
+              it.type === 'SALE' &&
+              it.customer?.id === out.ca_customer.id &&
+              Math.abs((it.paymentCondition?.installments?.[0]?.value || 0) - Number(c.valorImplementacao)) < 0.01
+            );
+            if (items.length < 50) break;
+          }
           if (existingAvulsa) {
             out.ca_setupSale = { id: existingAvulsa.id, legacyId: existingAvulsa.legacyId, reused: true };
           } else {
