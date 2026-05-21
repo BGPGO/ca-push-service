@@ -230,6 +230,10 @@ async function createScheduledSale(customerId, contract, opts) {
   const startDate = String(contract.dataAssinatura).slice(0, 10);
   const dueDay = parseInt(contract.diaVencimento, 10) || 5;
   const firstDueDate = firstDueAfter(emissionDate, dueDay);
+  // endDate: mesmo em FOREVER a CA exige um valor. Coloca 11 meses pra frente do start.
+  const endD = new Date(startDate);
+  endD.setUTCMonth(endD.getUTCMonth() + 11);
+  const endDate = endD.toISOString().slice(0, 10);
 
   const body = {
     emissionDate,
@@ -240,7 +244,7 @@ async function createScheduledSale(customerId, contract, opts) {
       frequencyRange: 1,
       expirationType: 'FOREVER',
       startDate,
-      endDate: null,
+      endDate,
       saleEmissionDay: 1,
     },
     categoryId: map.cat,
