@@ -15,6 +15,20 @@ const CA_XAUTH = process.env.CA_XAUTH || '';
 const CA_BASE = 'https://services.contaazul.com';
 const ORIGIN = 'https://pro.contaazul.com';
 
+// CRM Supabase (origem dos dados do contrato assinado)
+const CRM_SUPABASE_URL = process.env.CRM_SUPABASE_URL || 'https://gqjgbwzxlqkwvrtorhvb.supabase.co';
+const CRM_SERVICE_KEY = process.env.CRM_SERVICE_KEY || '';
+
+// FinHub Supabase (cria cliente final via edge function create-client)
+const FINHUB_SUPABASE_URL = process.env.FINHUB_SUPABASE_URL || 'https://pbtheffdoebfryttkyge.supabase.co';
+const FINHUB_SERVICE_KEY = process.env.FINHUB_SERVICE_KEY || '';
+
+// Gate: somente clientes com esse keyword no nome (case-insensitive) entram no funil novo
+const TESTE_KEYWORD = (process.env.TESTE_KEYWORD || 'teste').toLowerCase();
+
+// Background scan interval (segundos). 0 = desativado.
+const SCAN_INTERVAL_SEC = parseInt(process.env.SCAN_INTERVAL_SEC || '0', 10);
+
 // Default seller (Josi) + financial account (Conta PJ CA IP) + cidade Porto Alegre
 const DEFAULTS = {
   sellerId: '36f44a62-2517-461f-b3d6-b8a745608740',
@@ -321,6 +335,189 @@ async function createSetupSale(customerId, contract, opts) {
   return { id: r.body.id, legacyId: r.body.legacyId, number: r.body.number };
 }
 
+// ---------- CRM / FinHub helpers ----------
+function crmRequest(method, path, body) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(CRM_SUPABASE_URL + '/rest/v1' + path);
+    const data = body ? Buffer.from(JSON.stringify(body)) : null;
+    const opts = {
+      hostname: u.hostname, path: u.pathname + (u.search || ''),
+      method,
+      headers: {
+        'apikey': CRM_SERVICE_KEY,
+        'Authorization': `Bearer ${CRM_SERVICE_KEY}`,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'Accept-Encoding': 'identity',
+      },
+    };
+    if (data) opts.headers['Content-Length'] = data.length;
+    const req = https.request(opts, res => {
+      const chunks = []; res.on('data', c => chunks.push(c));
+      res.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf-8');
+        try { resolve({ status: res.statusCode, body: text ? JSON.parse(text) : null }); }
+        catch { resolve({ status: res.statusCode, body: text }); }
+      });
+    });
+    req.on('error', reject);
+    if (data) req.write(data);
+    req.end();
+  });
+}
+
+function finhubFunction(fname, body) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(`${FINHUB_SUPABASE_URL}/functions/v1/${fname}`);
+    const data = Buffer.from(JSON.stringify(body));
+    const opts = {
+      hostname: u.hostname, path: u.pathname, method: 'POST',
+      headers: {
+        'apikey': FINHUB_SERVICE_KEY,
+        'Authorization': `Bearer ${FINHUB_SERVICE_KEY}`,
+        'Content-Type': 'application/json',
+        'Content-Length': data.length,
+      },
+    };
+    const req = https.request(opts, res => {
+      const chunks = []; res.on('data', c => chunks.push(c));
+      res.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf-8');
+        try { resolve({ status: res.statusCode, body: text ? JSON.parse(text) : null }); }
+        catch { resolve({ status: res.statusCode, body: text }); }
+      });
+    });
+    req.on('error', reject);
+    req.write(data); req.end();
+  });
+}
+
+// ---------- SCAN logic ----------
+// Idempotency tracker in-memory (resets on restart, but CA /lookup acts as durable check)
+const processedContracts = new Set();
+
+async function scanAndProcessTest() {
+  if (!CRM_SERVICE_KEY) throw new Error('CRM_SERVICE_KEY nao configurada');
+
+  // 1) Busca Contracts SIGNED recentes (ultimas 48h) com relacao Deal+Org+Contact
+  const since = new Date(Date.now() - 48 * 3600 * 1000).toISOString();
+  const query = `?select=*,deal:Deal(id,title,closedAt,status,user:User(email),organization:Organization(name,cnpj,phone,email),contact:Contact(name,email,phone))&status=eq.SIGNED&autentiqueSignedAt=gte.${encodeURIComponent(since)}&order=autentiqueSignedAt.desc&limit=100`;
+  const r = await crmRequest('GET', '/Contract' + query);
+  if (r.status !== 200) throw new Error(`CRM Contract query falhou ${r.status}: ${JSON.stringify(r.body).slice(0,300)}`);
+
+  const eligible = [];
+  const skipped = [];
+  for (const c of (r.body || [])) {
+    // Gate name match — checa razaoSocial, contact.name, organization.name
+    const names = [c.razaoSocial, c.deal?.organization?.name, c.deal?.contact?.name, c.deal?.title]
+      .filter(Boolean).map(s => String(s).toLowerCase());
+    const matchesGate = names.some(n => n.includes(TESTE_KEYWORD));
+    if (!matchesGate) { skipped.push({ id: c.id, reason: 'no_teste_in_name', names }); continue; }
+    if (processedContracts.has(c.id)) { skipped.push({ id: c.id, reason: 'already_processed_inmem' }); continue; }
+    eligible.push(c);
+  }
+
+  const results = [];
+  for (const c of eligible) {
+    const out = { contract_id: c.id, started_at: new Date().toISOString() };
+    try {
+      const org = c.deal?.organization || {};
+      const contact = c.deal?.contact || {};
+      const cnpj = (c.cnpj || org.cnpj || '').replace(/\D/g, '');
+
+      // 2) Check idempotency in CA
+      const existing = await findCustomerByCnpj(cnpj);
+      const skipCa = !!existing;
+
+      if (!skipCa) {
+        // 3a) Push to CA
+        const customer = await createCustomer({
+          cnpj,
+          razaoSocial: c.razaoSocial,
+          nomeFantasia: c.nomeFantasia || '',
+          email: c.emailRepresentante || contact.email || '',
+          telefone: contact.phone || org.phone || '',
+          emailFinanceiro: c.emailFinanceiro || c.emailRepresentante,
+          endereco: c.endereco || '',
+        }, { testMode: true });
+        out.ca_customer = customer;
+
+        out.ca_scheduledSale = await createScheduledSale(customer.id, {
+          produto: c.produto,
+          valorMensal: Number(c.valorMensal),
+          diaVencimento: Number(c.diaVencimento || 10),
+          dataAssinatura: c.autentiqueSignedAt || c.dataInicio,
+          sellerEmail: c.deal?.user?.email,
+        }, { testMode: true });
+
+        if (Number(c.valorImplementacao) > 0) {
+          out.ca_setupSale = await createSetupSale(customer.id, {
+            produto: c.produto,
+            valorImplementacao: Number(c.valorImplementacao),
+            dataAssinatura: c.autentiqueSignedAt || c.dataInicio,
+            sellerEmail: c.deal?.user?.email,
+          }, { testMode: true });
+        }
+      } else {
+        out.ca_customer = { id: existing.id || existing.uuid, reused: true };
+        out.ca_skip_reason = 'customer_already_exists_in_ca';
+      }
+
+      // 3b) Push to FinHub (optional)
+      if (FINHUB_SERVICE_KEY) {
+        try {
+          const finResp = await finhubFunction('create-client', {
+            clientData: {
+              name: c.razaoSocial,
+              company: c.razaoSocial,
+              email: c.emailFinanceiro || c.emailRepresentante,
+              phone: contact.phone || org.phone || '',
+              cnpj,
+              senha_cliente: 'TempPass' + Math.random().toString(36).slice(-8) + '!',
+              risco: 'baixo',
+              status: 'ativo',
+              data_entrada: new Date().toISOString().slice(0, 10),
+              observacoes_importantes: `[TEST E2E PIPELINE] Auto-criado via ca-push-service. CRM Contract id=${c.id}`,
+            },
+          });
+          out.finhub = { status: finResp.status, body: finResp.body };
+        } catch (e) {
+          out.finhub_error = e.message;
+        }
+      } else {
+        out.finhub_skipped = 'FINHUB_SERVICE_KEY nao configurada';
+      }
+
+      processedContracts.add(c.id);
+      out.ok = true;
+    } catch (e) {
+      out.ok = false;
+      out.error = e.message;
+    }
+    out.finished_at = new Date().toISOString();
+    results.push(out);
+  }
+
+  return { scanned: r.body?.length || 0, eligible: eligible.length, skipped, results };
+}
+
+// Background poll (se SCAN_INTERVAL_SEC > 0)
+let scanLoopActive = false;
+async function scanLoopOnce() {
+  if (scanLoopActive) return;
+  scanLoopActive = true;
+  try {
+    const r = await scanAndProcessTest();
+    if (r.eligible > 0 || r.results.length > 0) {
+      console.log('[scan]', JSON.stringify(r));
+    }
+  } catch (e) {
+    console.error('[scan-error]', e.message);
+  } finally {
+    scanLoopActive = false;
+  }
+}
+
 // ---------- HTTP server ----------
 function checkAuth(req, res) {
   if (!ADMIN_TOKEN) return true; // dev mode
@@ -349,6 +546,15 @@ const server = http.createServer(async (req, res) => {
     // Quick CA token sanity check
     const r = await caRequest('GET', '/app/v1/scheduled-sales/next-number');
     return send(200, { ca_status: r.status, response: r.body });
+  }
+
+  if (req.method === 'POST' && u.pathname === '/scan') {
+    try {
+      const r = await scanAndProcessTest();
+      return send(200, r);
+    } catch (e) {
+      return send(500, { error: e.message, stack: e.stack });
+    }
   }
 
   if (req.method === 'GET' && u.pathname === '/lookup') {
@@ -423,12 +629,19 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
   console.log('================================================');
   console.log(`CA Push Service rodando em :${PORT}`);
-  console.log(`  POST /push-contract  (cria cliente + contrato + setup)`);
-  console.log(`  GET  /lookup?cnpj=X   (busca cliente)`);
-  console.log(`  GET  /probe           (sanity check)`);
+  console.log(`  POST /push-contract  (cria cliente + contrato + setup, direto)`);
+  console.log(`  POST /scan           (vasculha CRM, processa Contracts SIGNED com '${TESTE_KEYWORD}' no nome)`);
+  console.log(`  GET  /lookup?cnpj=X  (busca cliente)`);
+  console.log(`  GET  /probe          (sanity check)`);
   console.log(`  DELETE /scheduled-sales/{id}`);
   console.log(`  DELETE /sales/{id}`);
-  console.log(`  GET  /health          (public)`);
+  console.log(`  GET  /health         (public)`);
   console.log(`  Auth: Bearer ADMIN_TOKEN`);
+  console.log(`  CRM_SERVICE_KEY: ${CRM_SERVICE_KEY ? 'OK' : 'MISSING'}`);
+  console.log(`  FINHUB_SERVICE_KEY: ${FINHUB_SERVICE_KEY ? 'OK' : 'MISSING (CA only)'}`);
   console.log('================================================');
+  if (SCAN_INTERVAL_SEC > 0) {
+    console.log(`[bg-scan] Loop ativo a cada ${SCAN_INTERVAL_SEC}s`);
+    setInterval(scanLoopOnce, SCAN_INTERVAL_SEC * 1000);
+  }
 });
