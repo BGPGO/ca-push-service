@@ -471,13 +471,12 @@ async function scanAndProcessTest() {
       const contact = c.deal?.contact || {};
       const cnpj = (c.cnpj || org.cnpj || '').replace(/\D/g, '');
 
-      // 2) Check idempotency in CA
+      // 2) Customer: dedup OR create
       const existing = await findCustomerByCnpj(cnpj);
-      const skipCa = !!existing;
-
-      if (!skipCa) {
-        // 3a) Push to CA
-        const customer = await createCustomer({
+      if (existing) {
+        out.ca_customer = { id: existing.id || existing.uuid, reused: true };
+      } else {
+        out.ca_customer = await createCustomer({
           cnpj,
           razaoSocial: c.razaoSocial,
           nomeFantasia: c.nomeFantasia || '',
@@ -486,27 +485,25 @@ async function scanAndProcessTest() {
           emailFinanceiro: c.emailFinanceiro || c.emailRepresentante,
           endereco: c.endereco || '',
         }, { testMode: true });
-        out.ca_customer = customer;
+      }
 
-        out.ca_scheduledSale = await createScheduledSale(customer.id, {
+      // 3) Scheduled-sale: SEMPRE cria (independente se customer foi reused)
+      out.ca_scheduledSale = await createScheduledSale(out.ca_customer.id, {
+        produto: c.produto,
+        valorMensal: Number(c.valorMensal),
+        diaVencimento: Number(c.diaVencimento || 10),
+        dataAssinatura: c.autentiqueSignedAt || c.dataInicio,
+        sellerEmail: c.deal?.user?.email,
+      }, { testMode: true });
+
+      // 4) Setup avulso se houver
+      if (Number(c.valorImplementacao) > 0) {
+        out.ca_setupSale = await createSetupSale(out.ca_customer.id, {
           produto: c.produto,
-          valorMensal: Number(c.valorMensal),
-          diaVencimento: Number(c.diaVencimento || 10),
+          valorImplementacao: Number(c.valorImplementacao),
           dataAssinatura: c.autentiqueSignedAt || c.dataInicio,
           sellerEmail: c.deal?.user?.email,
         }, { testMode: true });
-
-        if (Number(c.valorImplementacao) > 0) {
-          out.ca_setupSale = await createSetupSale(customer.id, {
-            produto: c.produto,
-            valorImplementacao: Number(c.valorImplementacao),
-            dataAssinatura: c.autentiqueSignedAt || c.dataInicio,
-            sellerEmail: c.deal?.user?.email,
-          }, { testMode: true });
-        }
-      } else {
-        out.ca_customer = { id: existing.id || existing.uuid, reused: true };
-        out.ca_skip_reason = 'customer_already_exists_in_ca';
       }
 
       // 3b) Push to FinHub (insert direto em clients, bypassa edge function)
