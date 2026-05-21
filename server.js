@@ -103,6 +103,15 @@ function caRequest(method, urlPath, body) {
 
 // ---------- Pipeline operations ----------
 function cleanCnpj(s) { return String(s || '').replace(/\D/g, ''); }
+function cleanPhone(s) {
+  let d = String(s || '').replace(/\D/g, '');
+  // strip Brazil country code 55 if present and total > 11 digits
+  if (d.length === 13 && d.startsWith('55')) d = d.slice(2);
+  if (d.length === 12 && d.startsWith('55')) d = d.slice(2);
+  // CA accepts 10 (fixed) or 11 (mobile) digits
+  if (d.length > 11) d = d.slice(-11);
+  return d;
+}
 function fmtCnpj(s) {
   const c = cleanCnpj(s);
   if (c.length !== 14) return s;
@@ -136,7 +145,7 @@ async function createCustomer(c, opts) {
     generalRegistry: '',
     birthDate: c.dataAbertura || '2026-01-01',
     email: c.email || '',
-    commercialPhone: cleanCnpj(c.telefone || ''),
+    commercialPhone: cleanPhone(c.telefone || ''),
     cellPhone: '',
     observation: c.endereco ? `Endereco: ${c.endereco}` : '',
     idContactPrincipal: '',
@@ -148,7 +157,7 @@ async function createCustomer(c, opts) {
     attachments: [{ description: '' }],
     billingContact: {
       emails: [c.emailFinanceiro || c.email || ''].filter(Boolean),
-      phoneNumber: cleanCnpj(c.telefoneFinanceiro || c.telefone || ''),
+      phoneNumber: cleanPhone(c.telefoneFinanceiro || c.telefone || ''),
     },
     origin: 'CadastroUnico',
   };
