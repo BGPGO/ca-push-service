@@ -1,0 +1,9 @@
+{
+  "name": "ca-push-service",
+  "version": "1.0.0",
+  "description": "BGP Conta Azul Pro push service - cria cliente + contrato recorrente + setup avulso",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
+  "private": true
+}
