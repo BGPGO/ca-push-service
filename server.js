@@ -442,8 +442,9 @@ async function finhubCreateClient(payload) {
 // Idempotency tracker in-memory (resets on restart, but CA /lookup acts as durable check)
 const processedContracts = new Set();
 
-async function scanAndProcessTest() {
+async function scanAndProcessTest(opts = {}) {
   if (!CRM_SERVICE_KEY) throw new Error('CRM_SERVICE_KEY nao configurada');
+  const force = !!opts.force;
 
   // 1) Busca Contracts SIGNED recentes (ultimas 48h) com relacao Deal+Org+Contact
   const since = new Date(Date.now() - 48 * 3600 * 1000).toISOString();
@@ -459,7 +460,7 @@ async function scanAndProcessTest() {
       .filter(Boolean).map(s => String(s).toLowerCase());
     const matchesGate = names.some(n => n.includes(TESTE_KEYWORD));
     if (!matchesGate) { skipped.push({ id: c.id, reason: 'no_teste_in_name', names }); continue; }
-    if (processedContracts.has(c.id)) { skipped.push({ id: c.id, reason: 'already_processed_inmem' }); continue; }
+    if (!force && processedContracts.has(c.id)) { skipped.push({ id: c.id, reason: 'already_processed_inmem' }); continue; }
     eligible.push(c);
   }
 
@@ -589,7 +590,8 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'POST' && u.pathname === '/scan') {
     try {
-      const r = await scanAndProcessTest();
+      const force = u.searchParams.get('force') === 'true' || u.searchParams.get('force') === '1';
+      const r = await scanAndProcessTest({ force });
       return send(200, r);
     } catch (e) {
       return send(500, { error: e.message, stack: e.stack });
