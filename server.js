@@ -227,27 +227,33 @@ async function findScheduledSaleByCustomer(customerId, searchTerm = '') {
   return null;
 }
 
+const SERVICE_VERSION = '2026-05-21T20:35:00Z-discount-v3';
+
 // Aplica desconto nas N primeiras parcelas geradas (idempotente — pode rodar várias vezes sem duplicar efeito)
 async function applyDiscountToFirstN(schedId, descontoMeses, descontoPercentual, valorMensal, searchTerm = '') {
-  if (!descontoMeses || !descontoPercentual) return [];
+  if (!descontoMeses || !descontoPercentual) return { applied: [], error: 'missing params' };
   const N = Math.floor(descontoMeses);
   const descontoVal = Math.round((valorMensal * descontoPercentual / 100) * 100) / 100;
   const baseCom = Math.round((valorMensal - descontoVal) * 100) / 100;
 
-  // GET instances filtrando por searchTerm pra trazer só do cliente certo (search global da CA é paginado)
+  // GET ALL instances of this scheduled-sale via pagination (search é global mas filtramos por schedule.id)
   const allLinked = [];
-  for (let page = 1; page <= 5; page++) {
+  const debug = { pages_fetched: 0, total_items_seen: 0 };
+  for (let page = 1; page <= 10; page++) {
     const search = await caRequest('POST', `/contaazul-bff/sale/v1/sales/searches?page=${page}&page_size=50`, { searchTerm });
     const items = search.body?.items || [];
+    debug.pages_fetched = page;
+    debug.total_items_seen += items.length;
     if (items.length === 0) break;
     for (const it of items) {
       if (it.type === 'SCHEDULED_SALE' && it.schedule?.id === schedId) allLinked.push(it);
     }
     if (items.length < 50) break;
   }
+  debug.linked_found = allLinked.length;
   const linked = allLinked.sort((a, b) => (a.date || '').localeCompare(b.date || ''));
   const targets = linked.slice(0, N);
-  if (targets.length === 0) return [];
+  if (targets.length === 0) return { applied: [], debug };
 
   const tax = await calcTaxes(baseCom);
   const results = [];
@@ -310,7 +316,7 @@ async function applyDiscountToFirstN(schedId, descontoMeses, descontoPercentual,
     const putR = await caRequest('PUT', `/app/v1/scheduled-sales/${schedId}/sales/${sid}`, body);
     results.push({ sid, status: putR.status, date: t.date });
   }
-  return results;
+  return { applied: results, debug };
 }
 
 async function createScheduledSale(customerId, contract, opts) {
@@ -619,14 +625,24 @@ async function scanAndProcessTest(opts = {}) {
         }, { testMode: true });
       }
 
-      // 3.5/4) Discount e Setup desativados no scan automático até dedup estar 100% estável.
-      // Usuário aplica via endpoints dedicados POST /apply-discount e POST /apply-setup.
-      // Marcadores informativos:
+      // 3.5) Aplica desconto nas N primeiras parcelas (chama endpoint interno, idempotente por skip de "already_discounted")
       if (Number(c.descontoMeses) > 0 && Number(c.descontoPercentual) > 0) {
-        out.ca_discount_pending = `Aplicar desconto ${c.descontoPercentual}% nas ${c.descontoMeses} primeiras parcelas (use POST /apply-discount/${out.ca_scheduledSale.id})`;
+        try {
+          out.ca_discount_result = await applyDiscountToFirstN(
+            out.ca_scheduledSale.id,
+            Number(c.descontoMeses),
+            Number(c.descontoPercentual),
+            Number(c.valorMensal),
+            c.razaoSocial || ''
+          );
+        } catch (e) {
+          out.ca_discount_error = e.message;
+        }
       }
+
+      // 4) Setup ainda manual via painel (CA não aceita DELETE de venda avulsa via API, evita acúmulo)
       if (Number(c.valorImplementacao) > 0) {
-        out.ca_setup_pending = `Criar setup avulso R$ ${c.valorImplementacao} (use POST /apply-setup/${out.ca_customer.id})`;
+        out.ca_setup_pending = `Criar setup avulso R$ ${c.valorImplementacao} manualmente no painel CA Pro`;
       }
 
       // 3b) Push to FinHub (insert direto em clients, bypassa edge function)
@@ -699,7 +715,7 @@ const server = http.createServer(async (req, res) => {
   };
 
   if (req.method === 'GET' && u.pathname === '/health') {
-    return send(200, { ok: true, ts: Date.now() });
+    return send(200, { ok: true, ts: Date.now(), version: SERVICE_VERSION });
   }
 
   if (!checkAuth(req, res)) return;
@@ -708,6 +724,24 @@ const server = http.createServer(async (req, res) => {
     // Quick CA token sanity check
     const r = await caRequest('GET', '/app/v1/scheduled-sales/next-number');
     return send(200, { ca_status: r.status, response: r.body });
+  }
+
+  // Endpoint dedicado pra aplicar desconto: POST /apply-discount/{schedId}?meses=3&pct=10&valor=123&searchTerm=...
+  if (req.method === 'POST' && u.pathname.startsWith('/apply-discount/')) {
+    try {
+      const schedId = u.pathname.split('/').pop();
+      const meses = parseInt(u.searchParams.get('meses') || '0', 10);
+      const pct = parseFloat(u.searchParams.get('pct') || '0');
+      const valor = parseFloat(u.searchParams.get('valor') || '0');
+      const term = u.searchParams.get('searchTerm') || '';
+      if (!schedId || !meses || !pct || !valor) {
+        return send(400, { error: 'meses, pct, valor required' });
+      }
+      const r = await applyDiscountToFirstN(schedId, meses, pct, valor, term);
+      return send(200, r);
+    } catch (e) {
+      return send(500, { error: e.message, stack: e.stack });
+    }
   }
 
   if (req.method === 'POST' && u.pathname === '/scan') {
