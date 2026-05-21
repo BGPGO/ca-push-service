@@ -308,8 +308,13 @@ async function createSetupSale(customerId, contract, opts) {
   const tax = await calcTaxes(valor);
   const committedDate = String(contract.dataAssinatura).slice(0, 10);
 
+  // /sales tem proprio next-number sequencial
+  const nn = await caRequest('GET', '/app/v1/sales/next-number');
+  const saleNumber = (nn.body && nn.body.number) || null;
+
   const body = {
     customerId,
+    number: saleNumber,
     committedDate,
     categoryId: map.cat,
     costCenterId: map.cc,
