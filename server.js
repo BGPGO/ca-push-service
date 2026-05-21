@@ -45,6 +45,7 @@ const PRODUCT_MAP = {
   'bgp-go-iii': { cc: '0f8b1cc6-37fe-11f0-bf12-4f0c48fc1e3e', cat: '62acd13c-d0a6-4935-b234-8bc2c6e2890c' },
   'bgp-bi': { cc: '3b5f86a0-d9b0-11ee-a7fd-579af0a23ded', cat: 'b4387188-29c7-4906-9345-35bf7b66f515' },
   'bgp-bi-personalizado': { cc: 'd6298da0-37fd-11f0-a011-afb236fae052', cat: 'b4387188-29c7-4906-9345-35bf7b66f515' },
+  'bi-personalizado': { cc: 'd6298da0-37fd-11f0-a011-afb236fae052', cat: 'b4387188-29c7-4906-9345-35bf7b66f515' },
   'bgp-strategy': { cc: 'b9958064-fb44-11ee-bf23-738a7691524e', cat: 'e748c192-2b5e-437f-877a-3739d145bd20' },
   'bgp-valuation': { cc: '1ac117e4-37fe-11f0-9c0c-4f3d632514d2', cat: 'a882d0ea-5f90-422c-b613-6e6cb71f0260' },
   'brand-growth': { cc: '396de6fa-d05a-11f0-a205-f7c9cebf091f', cat: '7ca280ae-c469-4ff4-b2ae-e59099f45395' },
@@ -212,6 +213,97 @@ function firstDueAfter(emissionDate, dueDay) {
 
 function normalizeProductKey(s) {
   return String(s || '').toLowerCase().trim().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+}
+
+// Verifica se cliente CA já tem scheduled-sale ativa (pra idempotência durável)
+async function findScheduledSaleByCustomer(customerId, searchTerm = '') {
+  const r = await caRequest('POST',
+    '/contaazul-bff/sale/v1/scheduled-sales/searches?page=1&page_size=50',
+    { totals: 'ENABLED', searchTerm });
+  if (r.status !== 200 || !r.body?.items) return null;
+  for (const it of r.body.items) {
+    if (it?.template?.customer?.id === customerId && it.status !== 'DISABLED') return it;
+  }
+  return null;
+}
+
+// Aplica desconto nas N primeiras parcelas geradas (idempotente — pode rodar várias vezes sem duplicar efeito)
+async function applyDiscountToFirstN(schedId, descontoMeses, descontoPercentual, valorMensal) {
+  if (!descontoMeses || !descontoPercentual) return [];
+  const N = Math.floor(descontoMeses);
+  const descontoVal = Math.round((valorMensal * descontoPercentual / 100) * 100) / 100;
+  const baseCom = Math.round((valorMensal - descontoVal) * 100) / 100;
+
+  // GET instances (sale instances geradas pelo scheduled-sale)
+  const search = await caRequest('POST', '/contaazul-bff/sale/v1/sales/searches?page=1&page_size=50', { searchTerm: '' });
+  const linked = (search.body?.items || [])
+    .filter(it => it.type === 'SCHEDULED_SALE' && it.schedule?.id === schedId)
+    .sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+  const targets = linked.slice(0, N);
+  if (targets.length === 0) return [];
+
+  const tax = await calcTaxes(baseCom);
+  const results = [];
+  for (const t of targets) {
+    const sid = t.id;
+    const saleResp = await caRequest('GET', `/app/v1/scheduled-sales/${schedId}/sales/${sid}`);
+    if (saleResp.status !== 200) { results.push({ sid, status: saleResp.status, error: 'GET failed' }); continue; }
+    const sale = saleResp.body;
+    // Se já tem o desconto exato → skip (idempotency)
+    if (Math.abs((sale.valueComposition?.discount?.value || 0) - descontoVal) < 0.01) {
+      results.push({ sid, status: 200, skipped: 'already_discounted' });
+      continue;
+    }
+    const itemsResp = await caRequest('GET', `/search-engine-core/v1/sales/${sid}/items?page=1&page_size=10`);
+    const items = (itemsResp.body?.items || []).map(it => ({
+      description: it.description || '',
+      amount: it.amount,
+      value: it.value,
+      id: it.id,
+      saleItemId: it.saleItemId,
+      costValue: it.costValue || 0,
+      priceAdjustmentMethod: null,
+    }));
+    const body = {
+      saleId: sid,
+      emissionDate: sale.committedDate,
+      customerId: sale.customerId,
+      terms: {
+        number: sale.terms.number,
+        frequencyType: sale.terms.frequencyType,
+        frequencyRange: sale.terms.frequencyRange,
+        expirationType: sale.terms.expirationType,
+        endDate: sale.terms.endDate,
+        saleEmissionDay: sale.terms.saleEmissionDay,
+      },
+      categoryId: sale.categoryId,
+      costCenterBySale: true,
+      costCenterId: sale.costCenterId,
+      ownerId: sale.ownerId,
+      serviceProviderLocationId: sale.serviceProviderLocationId,
+      observations: sale.observations || '',
+      invoiceObservations: sale.invoiceObservations || '',
+      autoTasks: sale.autoTasks,
+      valueComposition: {
+        shipping: 0,
+        discount: { type: 'VALUE', value: descontoVal },
+        serviceTaxTotal: tax.values.retained,
+      },
+      paymentCondition: sale.paymentCondition,
+      saleItems: items,
+      version: sale.version || 0,
+      chargeRequestMetadata: sale.chargeRequestMetadata || { charge: { type: 'BILLET' } },
+      serviceTaxInformation: {
+        id: DEFAULTS.serviceIdNfse,
+        values: tax.values,
+        taxes: tax.taxes,
+        provisionPlace: { cityId: DEFAULTS.cityId },
+      },
+    };
+    const putR = await caRequest('PUT', `/app/v1/scheduled-sales/${schedId}/sales/${sid}`, body);
+    results.push({ sid, status: putR.status, date: t.date });
+  }
+  return results;
 }
 
 async function createScheduledSale(customerId, contract, opts) {
