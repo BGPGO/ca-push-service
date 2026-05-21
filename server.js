@@ -227,7 +227,7 @@ async function findScheduledSaleByCustomer(customerId, searchTerm = '') {
   return null;
 }
 
-const SERVICE_VERSION = '2026-05-21T20:50:00Z-finhub-complete';
+const SERVICE_VERSION = '2026-05-21T21:05:00Z-finhub-complete-v2';
 
 // Mapeamento produto BGP CRM -> FinHub products table (id + display_name)
 const FINHUB_PRODUCT_MAP = {
@@ -542,11 +542,16 @@ async function finhubCreateClient(payload) {
   const cnpj = (payload.cnpj || '').replace(/\D/g, '');
   if (!cnpj) throw new Error('CNPJ obrigatório pra criar cliente FinHub');
 
-  // 1) Dedup clients por CNPJ
-  const dup = await finhubRest('GET', `/clients?cnpj=eq.${cnpj}&select=id,name&limit=1`);
-  let clientId, clientName, reused = false;
+  // 1) Dedup clients por CNPJ (e auto-corrige conta_azul_code se ficou UUID antigo)
+  const dup = await finhubRest('GET', `/clients?cnpj=eq.${cnpj}&select=id,name,conta_azul_code&limit=1`);
+  let clientId, clientName, reused = false, fixedCaCode = false;
   if (dup.status === 200 && Array.isArray(dup.body) && dup.body.length > 0) {
     clientId = dup.body[0].id; clientName = dup.body[0].name; reused = true;
+    // Se conta_azul_code != CNPJ, corrige
+    if (dup.body[0].conta_azul_code !== cnpj) {
+      await finhubRest('PATCH', `/clients?id=eq.${clientId}`, { conta_azul_code: cnpj });
+      fixedCaCode = true;
+    }
   } else {
     // 2) INSERT clients (conta_azul_code = CNPJ, padrão do FinHub)
     const now = new Date().toISOString();
@@ -622,7 +627,7 @@ async function finhubCreateClient(payload) {
     }
   }
 
-  return { reused, id: clientId, name: clientName, conta_azul_code: cnpj, client_product: productRow, pit_wall: pitWallRow };
+  return { reused, fixed_ca_code: fixedCaCode, id: clientId, name: clientName, conta_azul_code: cnpj, client_product: productRow, pit_wall: pitWallRow };
 }
 
 // ---------- SCAN logic ----------
