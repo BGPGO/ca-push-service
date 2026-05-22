@@ -23,8 +23,11 @@ const CRM_SERVICE_KEY = process.env.CRM_SERVICE_KEY || '';
 const FINHUB_SUPABASE_URL = process.env.FINHUB_SUPABASE_URL || 'https://pbtheffdoebfryttkyge.supabase.co';
 const FINHUB_SERVICE_KEY = process.env.FINHUB_SERVICE_KEY || '';
 
-// Gate: somente clientes com esse keyword no nome (case-insensitive) entram no funil novo
-const TESTE_KEYWORD = (process.env.TESTE_KEYWORD || 'teste').toLowerCase();
+// Gate desativado em produção. Pra ativar de novo, set TESTE_KEYWORD env (vazio = sem gate).
+const TESTE_KEYWORD = (process.env.TESTE_KEYWORD || '').toLowerCase();
+
+// Kill switch: se 'true', /scan retorna sem processar nada (preserva tudo, só skip).
+const KILL_SWITCH = String(process.env.KILL_SWITCH || '').toLowerCase() === 'true';
 
 // Background scan interval (segundos). 0 = desativado.
 const SCAN_INTERVAL_SEC = parseInt(process.env.SCAN_INTERVAL_SEC || '0', 10);
@@ -215,6 +218,84 @@ function normalizeProductKey(s) {
   return String(s || '').toLowerCase().trim().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
 }
 
+// Upsell: PUT no scheduled-sale com novo valor e/ou nova categoria/CC
+async function updateScheduledSaleForUpsell(schedId, customerId, productKey, valorMensal, dueDay, searchTerm = '') {
+  const map = PRODUCT_MAP[productKey];
+  if (!map) throw new Error(`Produto desconhecido pra upsell: '${productKey}'`);
+  // Pega state atual do scheduled-sale + items
+  const cur = await caRequest('GET', `/app/v1/scheduled-sales/${schedId}`);
+  if (cur.status !== 200) throw new Error(`GET scheduled-sale ${schedId}: ${cur.status}`);
+  const sched = cur.body;
+  // Pega saleId da próxima instance + items dela
+  const saleId = sched.saleId;
+  if (!saleId) throw new Error('scheduled-sale sem saleId proxima');
+  const itemsR = await caRequest('GET', `/search-engine-core/v1/sales/${saleId}/items?page=1&page_size=10`);
+  const oldItems = itemsR.body?.items || [];
+  // Calcula novos taxes
+  const tax = await calcTaxes(valorMensal);
+  // emissionDate = dia 1 do próximo mês (assim novas parcelas usam novo valor)
+  const today = new Date();
+  const nextMonthFirst = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth() + 1, 1)).toISOString().slice(0, 10);
+  const firstDueDate = (() => {
+    const d = new Date(nextMonthFirst);
+    if (d.getUTCDate() > dueDay) d.setUTCMonth(d.getUTCMonth() + 1);
+    d.setUTCDate(dueDay);
+    return d.toISOString().slice(0, 10);
+  })();
+  const body = {
+    saleId,
+    emissionDate: nextMonthFirst,
+    customerId,
+    terms: {
+      number: sched.terms.number,
+      frequencyType: sched.terms.frequencyType,
+      frequencyRange: sched.terms.frequencyRange,
+      expirationType: sched.terms.expirationType,
+      endDate: sched.terms.endDate,
+      saleEmissionDay: sched.terms.saleEmissionDay,
+    },
+    categoryId: map.cat,                  // pode mudar (BI → STRATEGY etc.)
+    costCenterBySale: true,
+    costCenterId: map.cc,                 // pode mudar
+    ownerId: sched.ownerId,
+    serviceProviderLocationId: DEFAULTS.cityId,
+    observations: sched.observations || '',
+    invoiceObservations: sched.invoiceObservations || '',
+    autoTasks: sched.autoTasks,
+    valueComposition: {
+      shipping: 0,
+      discount: { type: 'VALUE', value: 0 },
+      serviceTaxTotal: tax.values.retained,
+    },
+    paymentCondition: {
+      paymentType: 'BANKING_BILLET',
+      financialAccountId: DEFAULTS.financialAccountId,
+      dueDay,
+      firstDueDate,
+    },
+    saleItems: oldItems.map(it => ({
+      description: it.description || '',
+      amount: it.amount,
+      value: valorMensal,                 // novo valor
+      id: it.id,
+      saleItemId: it.saleItemId,
+      costValue: it.costValue || 0,
+      priceAdjustmentMethod: null,
+    })),
+    version: sched.version || 0,
+    chargeRequestMetadata: sched.chargeRequestMetadata || { charge: { type: 'BILLET' } },
+    serviceTaxInformation: {
+      id: DEFAULTS.serviceIdNfse,
+      values: tax.values,
+      taxes: tax.taxes,
+      provisionPlace: { cityId: DEFAULTS.cityId },
+    },
+  };
+  const putR = await caRequest('PUT', `/app/v1/scheduled-sales/${schedId}`, body);
+  if (putR.status !== 200) throw new Error(`PUT scheduled-sale ${schedId}: ${putR.status} ${JSON.stringify(putR.body).slice(0,200)}`);
+  return { id: schedId, new_value: valorMensal, new_category: map.cat, new_cc: map.cc, emission_date: nextMonthFirst };
+}
+
 // Verifica se cliente CA já tem scheduled-sale ativa (pra idempotência durável)
 async function findScheduledSaleByCustomer(customerId, searchTerm = '') {
   const r = await caRequest('POST',
@@ -227,7 +308,38 @@ async function findScheduledSaleByCustomer(customerId, searchTerm = '') {
   return null;
 }
 
-const SERVICE_VERSION = '2026-05-21T21:05:00Z-finhub-complete-v2';
+const SERVICE_VERSION = '2026-05-21T21:30:00Z-prod-audit-upsell';
+
+// ---------- AUDIT LOG ----------
+// Grava em FinHub.bgp_pipeline_audit. Se a tabela não existir, falha silenciosamente.
+async function logAudit(ctx, step, action, status, detail, payload, startedAt) {
+  if (!FINHUB_SERVICE_KEY) return;
+  const duration_ms = startedAt ? (Date.now() - startedAt) : null;
+  const row = {
+    run_id: ctx.run_id,
+    cnpj: ctx.cnpj || null,
+    client_name: ctx.client_name || null,
+    crm_contract_id: ctx.crm_contract_id || null,
+    step, action, status,
+    detail: detail ? String(detail).slice(0, 1000) : null,
+    payload: payload || null,
+    duration_ms,
+  };
+  try {
+    const r = await finhubRest('POST', '/bgp_pipeline_audit', row);
+    if (r.status !== 201 && r.status !== 200) {
+      // tabela ausente ou erro — só logga local
+      console.warn('[audit-log skip]', r.status, JSON.stringify(r.body).slice(0,200));
+    }
+  } catch (e) {
+    console.warn('[audit-log fail]', e.message);
+  }
+}
+
+function uuid() {
+  return ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c =>
+    (c ^ (Math.random()*16) >> c/4).toString(16));
+}
 
 // Mapeamento produto BGP CRM -> FinHub products table (id + display_name)
 const FINHUB_PRODUCT_MAP = {
@@ -644,14 +756,20 @@ async function scanAndProcessTest(opts = {}) {
   const r = await crmRequest('GET', '/Contract' + query);
   if (r.status !== 200) throw new Error(`CRM Contract query falhou ${r.status}: ${JSON.stringify(r.body).slice(0,300)}`);
 
+  if (KILL_SWITCH) {
+    return { kill_switch: true, scanned: (r.body || []).length, skipped: [], results: [] };
+  }
+
   const eligible = [];
   const skipped = [];
   for (const c of (r.body || [])) {
-    // Gate name match — checa razaoSocial, contact.name, organization.name
-    const names = [c.razaoSocial, c.deal?.organization?.name, c.deal?.contact?.name, c.deal?.title]
-      .filter(Boolean).map(s => String(s).toLowerCase());
-    const matchesGate = names.some(n => n.includes(TESTE_KEYWORD));
-    if (!matchesGate) { skipped.push({ id: c.id, reason: 'no_teste_in_name', names }); continue; }
+    // Gate name match (se TESTE_KEYWORD for vazia, passa tudo)
+    if (TESTE_KEYWORD) {
+      const names = [c.razaoSocial, c.deal?.organization?.name, c.deal?.contact?.name, c.deal?.title]
+        .filter(Boolean).map(s => String(s).toLowerCase());
+      const matchesGate = names.some(n => n.includes(TESTE_KEYWORD));
+      if (!matchesGate) { skipped.push({ id: c.id, reason: `no_keyword_${TESTE_KEYWORD}`, names }); continue; }
+    }
     if (!force && processedContracts.has(c.id)) { skipped.push({ id: c.id, reason: 'already_processed_inmem' }); continue; }
     eligible.push(c);
   }
@@ -659,82 +777,120 @@ async function scanAndProcessTest(opts = {}) {
   const results = [];
   for (const c of eligible) {
     const out = { contract_id: c.id, started_at: new Date().toISOString() };
+    const ctx = { run_id: uuid(), cnpj: null, client_name: c.razaoSocial, crm_contract_id: c.id };
+    const t0 = Date.now();
     try {
       const org = c.deal?.organization || {};
       const contact = c.deal?.contact || {};
       const cnpj = (c.cnpj || org.cnpj || '').replace(/\D/g, '');
+      ctx.cnpj = cnpj;
+      await logAudit(ctx, 'watcher_scan', 'attempt', 'pending', `Iniciando pipeline pra ${c.razaoSocial}`, { contract: c.id, produto: c.produto, valor: c.valorMensal });
 
-      // 2) Customer: dedup OR create
+      // 2) Customer
+      const tCust = Date.now();
       const existing = await findCustomerByCnpj(cnpj);
       if (existing) {
         out.ca_customer = { id: existing.id || existing.uuid, reused: true };
+        await logAudit(ctx, 'ca_customer', 'reuse', 'reused', `Cliente já existe na CA (${existing.id || existing.uuid})`, { ca_id: existing.id }, tCust);
       } else {
         out.ca_customer = await createCustomer({
-          cnpj,
-          razaoSocial: c.razaoSocial,
-          nomeFantasia: c.nomeFantasia || '',
+          cnpj, razaoSocial: c.razaoSocial, nomeFantasia: c.nomeFantasia || '',
           email: c.emailRepresentante || contact.email || '',
           telefone: contact.phone || org.phone || '',
           emailFinanceiro: c.emailFinanceiro || c.emailRepresentante,
           endereco: c.endereco || '',
-        }, { testMode: true });
+        }, { testMode: false });
+        await logAudit(ctx, 'ca_customer', 'create', 'ok', `Criado cliente CA ${out.ca_customer.id}`, out.ca_customer, tCust);
       }
 
-      // 3) Scheduled-sale: dedup por customer (reusa se já existe ativo)
+      // 3) Scheduled-sale: dedup OR create OR upsell
+      const tSched = Date.now();
       const existingSched = await findScheduledSaleByCustomer(out.ca_customer.id, c.razaoSocial || '');
+      const newProductMap = PRODUCT_MAP[normalizeProductKey(c.produto)];
+      const newValor = Number(c.valorMensal);
+      const newDueDay = Number(c.diaVencimento || 10);
       if (existingSched) {
-        out.ca_scheduledSale = {
-          id: existingSched.id,
-          legacyId: existingSched.legacyId,
-          number: existingSched.template?.terms?.number,
-          reused: true,
-        };
+        // Detecta upsell
+        const oldValue = existingSched.template?.total || 0;
+        const oldCategoryId = existingSched.template?.categoryId;
+        const newCategoryId = newProductMap?.cat;
+        const valueChanged = Math.abs(oldValue - newValor) > 0.01;
+        const productChanged = oldCategoryId && newCategoryId && oldCategoryId !== newCategoryId;
+        if (valueChanged || productChanged) {
+          try {
+            out.ca_upsell = await updateScheduledSaleForUpsell(
+              existingSched.id, out.ca_customer.id,
+              normalizeProductKey(c.produto), newValor, newDueDay, c.razaoSocial || ''
+            );
+            out.ca_scheduledSale = { id: existingSched.id, legacyId: existingSched.legacyId, upsell: true };
+            await logAudit(ctx, 'upsell', 'update', 'ok',
+              `Upsell aplicado: valor ${oldValue}→${newValor}, productChanged=${productChanged}`,
+              out.ca_upsell, tSched);
+          } catch (e) {
+            out.ca_upsell_error = e.message;
+            out.ca_scheduledSale = { id: existingSched.id, reused: true, upsell_failed: true };
+            await logAudit(ctx, 'upsell', 'update', 'error', e.message, null, tSched);
+          }
+        } else {
+          out.ca_scheduledSale = {
+            id: existingSched.id, legacyId: existingSched.legacyId,
+            number: existingSched.template?.terms?.number, reused: true,
+          };
+          await logAudit(ctx, 'ca_scheduled_sale', 'reuse', 'reused',
+            `Scheduled-sale existente sem mudança (valor=${oldValue})`, { id: existingSched.id }, tSched);
+        }
       } else {
         out.ca_scheduledSale = await createScheduledSale(out.ca_customer.id, {
-          produto: c.produto,
-          valorMensal: Number(c.valorMensal),
-          diaVencimento: Number(c.diaVencimento || 10),
+          produto: c.produto, valorMensal: newValor, diaVencimento: newDueDay,
           dataAssinatura: c.autentiqueSignedAt || c.dataInicio || new Date().toISOString(),
           sellerEmail: c.deal?.user?.email,
-        }, { testMode: true });
+        }, { testMode: false });
+        await logAudit(ctx, 'ca_scheduled_sale', 'create', 'ok',
+          `Criado scheduled-sale num ${out.ca_scheduledSale.number}`, out.ca_scheduledSale, tSched);
       }
 
-      // 3.5) Aplica desconto nas N primeiras parcelas (chama endpoint interno, idempotente por skip de "already_discounted")
+      // 3.5) Desconto
       if (Number(c.descontoMeses) > 0 && Number(c.descontoPercentual) > 0) {
+        const tDisc = Date.now();
         try {
           out.ca_discount_result = await applyDiscountToFirstN(
-            out.ca_scheduledSale.id,
-            Number(c.descontoMeses),
-            Number(c.descontoPercentual),
-            Number(c.valorMensal),
-            c.razaoSocial || ''
+            out.ca_scheduledSale.id, Number(c.descontoMeses), Number(c.descontoPercentual),
+            newValor, c.razaoSocial || ''
           );
+          const applied = out.ca_discount_result.applied?.length || 0;
+          await logAudit(ctx, 'ca_discount', 'apply', 'ok',
+            `Desconto ${c.descontoPercentual}% em ${c.descontoMeses} parcelas (applied=${applied})`,
+            out.ca_discount_result, tDisc);
         } catch (e) {
           out.ca_discount_error = e.message;
+          await logAudit(ctx, 'ca_discount', 'apply', 'error', e.message, null, tDisc);
         }
       }
 
-      // 4) Setup ainda manual via painel (CA não aceita DELETE de venda avulsa via API, evita acúmulo)
+      // 4) Setup manual (CA não permite DELETE via API)
       if (Number(c.valorImplementacao) > 0) {
         out.ca_setup_pending = `Criar setup avulso R$ ${c.valorImplementacao} manualmente no painel CA Pro`;
+        await logAudit(ctx, 'ca_setup', 'skip', 'pending',
+          `Setup avulso R$ ${c.valorImplementacao} requer criação manual`, null, null);
       }
 
-      // 3b) Push to FinHub: clients + client_products + pit_wall (idempotente)
+      // 5) FinHub
       if (FINHUB_SERVICE_KEY) {
+        const tFin = Date.now();
         try {
           out.finhub = await finhubCreateClient({
-            name: c.razaoSocial,
-            company: c.razaoSocial,
+            name: c.razaoSocial, company: c.razaoSocial,
             email: c.emailFinanceiro || c.emailRepresentante,
             phone: contact.phone || org.phone || '',
-            cnpj,
-            produto: c.produto,
-            valorMensal: Number(c.valorMensal),
+            cnpj, produto: c.produto, valorMensal: newValor,
             erp_cliente: 'contaazul',
-            observacoes: `[TEST E2E PIPELINE] CRM Contract=${c.id} | Deal=${c.deal?.id} | CA customer=${out.ca_customer?.id || '?'} | CA scheduled-sale=${out.ca_scheduledSale?.id || '?'}`,
+            observacoes: `CRM Contract=${c.id} | CA customer=${out.ca_customer?.id} | CA scheduled-sale=${out.ca_scheduledSale?.id}`,
           });
+          await logAudit(ctx, 'finhub_client', out.finhub.reused ? 'reuse' : 'create',
+            'ok', `FinHub cliente ${out.finhub.id} (reused=${out.finhub.reused})`, out.finhub, tFin);
         } catch (e) {
           out.finhub_error = e.message;
+          await logAudit(ctx, 'finhub_client', 'create', 'error', e.message, null, tFin);
         }
       } else {
         out.finhub_skipped = 'FINHUB_SERVICE_KEY nao configurada';
@@ -742,9 +898,11 @@ async function scanAndProcessTest(opts = {}) {
 
       processedContracts.add(c.id);
       out.ok = true;
+      await logAudit(ctx, 'watcher_scan', 'complete', 'ok', 'Pipeline completo', null, t0);
     } catch (e) {
       out.ok = false;
       out.error = e.message;
+      await logAudit(ctx, 'watcher_scan', 'complete', 'error', e.message, { stack: e.stack?.slice(0,500) }, t0);
     }
     out.finished_at = new Date().toISOString();
     results.push(out);
@@ -789,10 +947,95 @@ const server = http.createServer(async (req, res) => {
   };
 
   if (req.method === 'GET' && u.pathname === '/health') {
-    return send(200, { ok: true, ts: Date.now(), version: SERVICE_VERSION });
+    return send(200, { ok: true, ts: Date.now(), version: SERVICE_VERSION, kill_switch: KILL_SWITCH, gate_keyword: TESTE_KEYWORD || '(disabled — processa todos)' });
   }
 
   if (!checkAuth(req, res)) return;
+
+  // Tela de auditoria (HTML)
+  if (req.method === 'GET' && u.pathname === '/admin/log') {
+    try {
+      const cnpjFilter = u.searchParams.get('cnpj');
+      const statusFilter = u.searchParams.get('status');
+      const limit = parseInt(u.searchParams.get('limit') || '200', 10);
+      let q = `/bgp_pipeline_audit?select=*&order=ts.desc&limit=${limit}`;
+      if (cnpjFilter) q += `&cnpj=eq.${cnpjFilter.replace(/\D/g,'')}`;
+      if (statusFilter) q += `&status=eq.${statusFilter}`;
+      const r = await finhubRest('GET', q);
+      const rows = Array.isArray(r.body) ? r.body : [];
+      const grouped = {};
+      for (const row of rows) {
+        const key = row.run_id;
+        if (!grouped[key]) grouped[key] = { run_id: row.run_id, cnpj: row.cnpj, client_name: row.client_name, ts: row.ts, steps: [] };
+        grouped[key].steps.push(row);
+      }
+      const runs = Object.values(grouped).sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
+      const statusColor = (s) => s === 'ok' ? '#16a34a' : s === 'error' ? '#dc2626' : s === 'reused' ? '#0891b2' : s === 'pending' ? '#d97706' : '#64748b';
+      const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>BGP Pipeline Audit</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; margin: 20px; background: #f8fafc; }
+  h1 { font-size: 20px; }
+  .filters { background: white; padding: 12px; border-radius: 8px; margin-bottom: 16px; border: 1px solid #e2e8f0; }
+  input, button, select { padding: 6px 10px; border: 1px solid #cbd5e1; border-radius: 4px; margin: 0 4px; }
+  button { background: #2563eb; color: white; border: none; cursor: pointer; }
+  .run { background: white; border: 1px solid #e2e8f0; border-radius: 8px; margin: 10px 0; padding: 12px 16px; }
+  .run-header { display: flex; justify-content: space-between; font-size: 13px; color: #475569; margin-bottom: 6px; }
+  .run-title { font-weight: 600; color: #0f172a; font-size: 14px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #f1f5f9; vertical-align: top; }
+  th { font-size: 11px; text-transform: uppercase; color: #64748b; font-weight: 600; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; color: white; font-size: 11px; font-weight: 600; }
+  .step { font-family: ui-monospace, monospace; font-size: 11px; color: #1e293b; }
+  .detail { color: #475569; max-width: 500px; }
+  details { margin-top: 4px; }
+  details summary { cursor: pointer; color: #2563eb; font-size: 11px; }
+  pre { background: #f1f5f9; padding: 8px; border-radius: 4px; overflow-x: auto; font-size: 11px; max-height: 200px; }
+  .muted { color: #94a3b8; font-size: 11px; }
+</style></head><body>
+<h1>📊 BGP Pipeline Audit</h1>
+<form class="filters" method="GET">
+  CNPJ: <input name="cnpj" value="${cnpjFilter||''}" placeholder="só dígitos">
+  Status: <select name="status">
+    <option value="">todos</option>
+    <option value="ok" ${statusFilter==='ok'?'selected':''}>ok</option>
+    <option value="error" ${statusFilter==='error'?'selected':''}>error</option>
+    <option value="reused" ${statusFilter==='reused'?'selected':''}>reused</option>
+    <option value="pending" ${statusFilter==='pending'?'selected':''}>pending</option>
+  </select>
+  Limit: <input name="limit" value="${limit}" type="number" min="10" max="1000" style="width:80px">
+  <button type="submit">filtrar</button>
+  <span class="muted">| ${rows.length} eventos, ${runs.length} runs</span>
+</form>
+${runs.map(run => {
+  const errors = run.steps.filter(s => s.status === 'error').length;
+  return `<div class="run">
+    <div class="run-header">
+      <span class="run-title">${run.client_name || '(sem nome)'} · CNPJ ${run.cnpj || '?'}</span>
+      <span class="muted">${run.ts} · run ${run.run_id?.slice(0,8)} · ${run.steps.length} steps${errors?` · <b style="color:#dc2626">${errors} erros</b>`:''}</span>
+    </div>
+    <table><thead><tr><th>step</th><th>action</th><th>status</th><th>detail</th><th>ms</th></tr></thead><tbody>
+    ${run.steps.sort((a,b)=>(a.ts||'').localeCompare(b.ts||'')).map(s => `
+      <tr>
+        <td class="step">${s.step}</td>
+        <td>${s.action}</td>
+        <td><span class="badge" style="background:${statusColor(s.status)}">${s.status}</span></td>
+        <td class="detail">${(s.detail||'').replace(/</g,'&lt;')}${s.payload ? `<details><summary>payload</summary><pre>${JSON.stringify(s.payload,null,2).replace(/</g,'&lt;')}</pre></details>` : ''}</td>
+        <td>${s.duration_ms ?? ''}</td>
+      </tr>`).join('')}
+    </tbody></table>
+  </div>`;
+}).join('')}
+${runs.length === 0 ? '<p class="muted">Nenhum evento. Tabela bgp_pipeline_audit existe? Rode o SQL em audit-table.sql no Supabase do FinHub.</p>' : ''}
+</body></html>`;
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(html);
+      return;
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'text/plain' });
+      res.end(`Erro: ${e.message}`);
+      return;
+    }
+  }
 
   if (req.method === 'GET' && u.pathname === '/probe') {
     // Quick CA token sanity check
