@@ -32,6 +32,12 @@ const KILL_SWITCH = String(process.env.KILL_SWITCH || '').toLowerCase() === 'tru
 // Background scan interval (segundos). 0 = desativado.
 const SCAN_INTERVAL_SEC = parseInt(process.env.SCAN_INTERVAL_SEC || '0', 10);
 
+// Cria a venda avulsa de SETUP automaticamente no /scan (com idempotência durável via
+// findSetupSaleByCustomer). DEFAULT OFF: a CA NÃO permite DELETE de venda avulsa via API,
+// então deixamos um humano ligar isso explicitamente (SETUP_AUTOCREATE=true) depois de revisar.
+// Com OFF, mantém o comportamento atual (só loga pendente) mas já reporta se o setup JÁ existe.
+const SETUP_AUTOCREATE = String(process.env.SETUP_AUTOCREATE || '').toLowerCase() === 'true';
+
 // Default seller (Josi) + financial account (Conta PJ CA IP) + cidade Porto Alegre
 const DEFAULTS = {
   sellerId: '36f44a62-2517-461f-b3d6-b8a745608740',
@@ -308,7 +314,42 @@ async function findScheduledSaleByCustomer(customerId, searchTerm = '') {
   return null;
 }
 
-const SERVICE_VERSION = '2026-05-21T21:30:00Z-prod-audit-upsell';
+// Idempotência DURÁVEL pro setup (a CA NÃO permite DELETE de venda avulsa via API → uma vez criada,
+// não dá pra desfazer). Busca uma venda AVULSA (type=SALE) já existente do cliente com o valor de setup.
+// Match por: customer.id + type=SALE + valor do ITEM == valorSetup (valor BRUTO; o `total` da venda
+// vem LÍQUIDO de retenção de ISS, então comparamos contra o item, não o total).
+// Retorna a venda encontrada (ou null). NÃO escreve nada.
+// IMPORTANTE: o searchTerm da CA casa por NOME (razão social), NÃO por CNPJ — por isso passamos o nome.
+async function findSetupSaleByCustomer(customerId, valorSetup, searchTerm = '') {
+  const alvo = Math.round(Number(valorSetup) * 100) / 100;
+  if (!customerId || !alvo) return null;
+  // Pagina sales/searches por nome e filtra por customer.id + type SALE (avulsa).
+  const candidatos = [];
+  for (let page = 1; page <= 10; page++) {
+    const r = await caRequest('POST',
+      `/contaazul-bff/sale/v1/sales/searches?page=${page}&page_size=50`, { searchTerm });
+    const items = r.body?.items || [];
+    if (items.length === 0) break;
+    for (const s of items) {
+      if (s.type === 'SCHEDULED_SALE') continue;            // só vendas avulsas
+      if (s.customer?.id !== customerId) continue;          // mesmo cliente
+      candidatos.push(s);
+    }
+    if (items.length < 50) break;
+  }
+  if (candidatos.length === 0) return null;
+  // Confere o valor de cada candidata pelos ITENS (valor bruto). Se algum item == valorSetup → já existe.
+  for (const s of candidatos) {
+    const itemsR = await caRequest('GET', `/search-engine-core/v1/sales/${s.id}/items?page=1&page_size=10`);
+    const its = itemsR.body?.items || [];
+    const somaItens = Math.round(its.reduce((a, it) => a + (Number(it.value) || 0) * (Number(it.amount) || 1), 0) * 100) / 100;
+    const algumItem = its.some(it => Math.abs((Number(it.value) || 0) - alvo) < 0.01);
+    if (algumItem || Math.abs(somaItens - alvo) < 0.01) return s;
+  }
+  return null;
+}
+
+const SERVICE_VERSION = '2026-05-27T00:00:00Z-setup-idem+upsell-fix+aditivo-alert';
 
 // ---------- AUDIT LOG ----------
 // Grava em FinHub.bgp_pipeline_audit. Se a tabela não existir, falha silenciosamente.
@@ -341,7 +382,11 @@ function uuid() {
     (c ^ (Math.random()*16) >> c/4).toString(16));
 }
 
-// Mapeamento produto BGP CRM -> FinHub products table (id + display_name)
+// ⚠️ DESCONTINUADO (2026-05-27): a tabela `client_products` foi descontinuada no FinHub.
+// A fonte de verdade de produto do cliente é o JSON `clients.produtos`.
+// Este mapa NÃO é mais usado em finhubCreateClient — mantido só como referência de product_id.
+// Para o nome do produto no JSON, use produtoJsonName().
+// Mapeamento produto BGP CRM -> FinHub products table (id + display_name) [LEGADO]
 const FINHUB_PRODUCT_MAP = {
   'bgp-bi':              { id: '5c9e70ed-6674-4847-b8ac-b319c2307eb7', name: 'BI' },
   'bi-personalizado':    { id: '4c64b935-cd59-4da2-925d-1a48d9d5b1ec', name: 'BI2B' },
@@ -356,7 +401,11 @@ const FINHUB_PRODUCT_MAP = {
 };
 
 // Aplica desconto nas N primeiras parcelas geradas (idempotente — pode rodar várias vezes sem duplicar efeito)
-async function applyDiscountToFirstN(schedId, descontoMeses, descontoPercentual, valorMensal, searchTerm = '') {
+// NOTA: o searchTerm da CA casa por NOME (razão social), NÃO por CNPJ (verificado ao vivo: busca por
+// CNPJ retorna 0 resultados). Por isso a busca é por nome. A chave forte de filtro é `schedule.id===schedId`
+// (durável, à prova de homônimos). `customerId` é cross-check opcional pra descartar parcela de homônimo
+// que por acaso tenha o mesmo schedId (não deve acontecer, mas barato validar).
+async function applyDiscountToFirstN(schedId, descontoMeses, descontoPercentual, valorMensal, searchTerm = '', customerId = null) {
   if (!descontoMeses || !descontoPercentual) return { applied: [], error: 'missing params' };
   const N = Math.floor(descontoMeses);
   const descontoVal = Math.round((valorMensal * descontoPercentual / 100) * 100) / 100;
@@ -364,19 +413,26 @@ async function applyDiscountToFirstN(schedId, descontoMeses, descontoPercentual,
 
   // GET ALL instances of this scheduled-sale via pagination (search é global mas filtramos por schedule.id)
   const allLinked = [];
-  const debug = { pages_fetched: 0, total_items_seen: 0 };
-  for (let page = 1; page <= 10; page++) {
+  const debug = { pages_fetched: 0, total_items_seen: 0, search_term: searchTerm };
+  for (let page = 1; page <= 20; page++) {   // 20 págs × 50 = até 1000 vendas (era 10 = 500)
     const search = await caRequest('POST', `/contaazul-bff/sale/v1/sales/searches?page=${page}&page_size=50`, { searchTerm });
     const items = search.body?.items || [];
     debug.pages_fetched = page;
     debug.total_items_seen += items.length;
     if (items.length === 0) break;
     for (const it of items) {
-      if (it.type === 'SCHEDULED_SALE' && it.schedule?.id === schedId) allLinked.push(it);
+      if (it.type !== 'SCHEDULED_SALE' || it.schedule?.id !== schedId) continue;
+      if (customerId && it.customer?.id && it.customer.id !== customerId) continue; // cross-check homônimo
+      allLinked.push(it);
     }
     if (items.length < 50) break;
   }
   debug.linked_found = allLinked.length;
+  // Se a busca por nome não achou NENHUMA parcela do schedId, sinaliza claramente (em vez de silêncio).
+  if (allLinked.length === 0) {
+    return { applied: [], error: 'no_linked_sales_found', debug,
+      hint: 'busca por nome não retornou parcelas deste schedId — nome genérico, fora da janela de páginas, ou parcelas ainda não geradas' };
+  }
   const linked = allLinked.sort((a, b) => (a.date || '').localeCompare(b.date || ''));
   const targets = linked.slice(0, N);
   if (targets.length === 0) return { applied: [], debug };
@@ -647,9 +703,27 @@ function finhubRest(method, path, body) {
   });
 }
 
-// Cria cliente no FinHub direto via REST (service_role bypassa RLS).
-// Pula edge function create-client porque ela exige JWT de user 'team'.
-// Cria: clients + client_products + pit_wall (mesmo padrão da create-client edge fn).
+// Produto CRM -> product_name usado no JSON clients.produtos (FONTE DE VERDADE do FinHub).
+// Mesma convenção do ingest-crm-contract.mapProdutoToFinhub (validada): família GO.
+function produtoJsonName(produtoRaw) {
+  const p = String(produtoRaw || '').toLowerCase().replace(/[-_]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!p) return null;
+  if (p.includes('go iii') || p.includes('go 3')) return 'GO III';
+  if (p.includes('go ii') || p.includes('go 2')) return 'GO II';
+  if (p.includes('go i') || p.includes('go 1')) return 'GO I';
+  if (p.includes('strategy') || p.includes('estrateg')) return 'Strategy';
+  if (p.includes('valuation')) return 'Valuation';
+  if (p.includes('brand') || p.includes('growth')) return 'Brand Growth';
+  if (p.includes('aimo')) return 'GO BI by AiMO';
+  if (p.includes('condomin')) return 'Gestão Condominial';
+  if (p.includes('bi')) return 'GO BI'; // BGP BI / BI Personalizado -> GO BI
+  return null;
+}
+
+// Cria/atualiza cliente no FinHub direto via REST (service_role bypassa RLS).
+// Pula edge function create-client (exige JWT 'team').
+// Escreve: clients + clients.produtos (JSON) + pit_wall.
+// ⚠️ client_products está DESCONTINUADO — NÃO escrever nela. Fonte de verdade = clients.produtos (JSON).
 async function finhubCreateClient(payload) {
   const cnpj = (payload.cnpj || '').replace(/\D/g, '');
   if (!cnpj) throw new Error('CNPJ obrigatório pra criar cliente FinHub');
@@ -689,30 +763,26 @@ async function finhubCreateClient(payload) {
     clientId = created.id; clientName = created.name;
   }
 
-  // 3) client_products (idempotente por client_id+product_id)
-  const productKey = normalizeProductKey(payload.produto || '');
-  const productMap = FINHUB_PRODUCT_MAP[productKey];
+  // 3) produtos (JSON em clients) — FONTE DE VERDADE do FinHub (client_products DESCONTINUADO).
+  //    Lê o JSON atual e faz merge idempotente por product_name (enrich se novo, upsell se valor mudou).
+  //    Lido por FaseOperacional / Carteira / PitWall.
+  const productName = produtoJsonName(payload.produto || '');
   let productRow = null;
-  if (productMap) {
-    const dupP = await finhubRest('GET',
-      `/client_products?client_id=eq.${clientId}&product_id=eq.${productMap.id}&select=id&limit=1`);
-    if (dupP.status === 200 && Array.isArray(dupP.body) && dupP.body.length > 0) {
-      productRow = { id: dupP.body[0].id, reused: true };
-    } else {
-      const cpRow = {
-        client_id: clientId,
-        product_name: productMap.name,
-        product_id: productMap.id,
-        value: payload.valorMensal || null,
-      };
-      const r = await finhubRest('POST', '/client_products', cpRow);
-      if (r.status === 201 || r.status === 200) {
-        const c = Array.isArray(r.body) ? r.body[0] : r.body;
-        productRow = { id: c.id, product_name: c.product_name, reused: false };
-      } else {
-        productRow = { error: `client_products insert ${r.status}: ${JSON.stringify(r.body).slice(0,200)}` };
-      }
-    }
+  if (productName) {
+    const cur = await finhubRest('GET', `/clients?id=eq.${clientId}&select=produtos&limit=1`);
+    const arr = (cur.status === 200 && Array.isArray(cur.body) && Array.isArray(cur.body[0]?.produtos))
+      ? cur.body[0].produtos : [];
+    const val = payload.valorMensal != null ? Number(payload.valorMensal) : null;
+    const idx = arr.findIndex(p =>
+      String(p.product_name || p.nome || p.name || '').toLowerCase() === productName.toLowerCase());
+    let action;
+    if (idx === -1) { arr.push({ product_name: productName, value: val, responsible: null }); action = 'added'; }
+    else if (val != null && val > 0 && Number(arr[idx].value) !== val) { arr[idx] = { ...arr[idx], value: val }; action = 'value_updated'; }
+    else action = 'noop';
+    const upd = await finhubRest('PATCH', `/clients?id=eq.${clientId}`, { produtos: arr });
+    productRow = (upd.status === 200 || upd.status === 204 || upd.status === 201)
+      ? { product_name: productName, action }
+      : { error: `clients.produtos PATCH ${upd.status}: ${JSON.stringify(upd.body).slice(0,200)}` };
   } else {
     productRow = { error: `produto não mapeado: '${payload.produto}'` };
   }
@@ -728,7 +798,7 @@ async function finhubCreateClient(payload) {
       client_id: clientId,
       prioridade_pontos_atencao: 'Novo cliente — configurar processos iniciais',
       status_reuniao_cliente: 'marcar',
-      produto: productMap?.name || null,
+      produto: productName || null,
     };
     const r = await finhubRest('POST', '/pit_wall', pwRow);
     if (r.status === 201 || r.status === 200) {
@@ -739,7 +809,7 @@ async function finhubCreateClient(payload) {
     }
   }
 
-  return { reused, fixed_ca_code: fixedCaCode, id: clientId, name: clientName, conta_azul_code: cnpj, client_product: productRow, pit_wall: pitWallRow };
+  return { reused, fixed_ca_code: fixedCaCode, id: clientId, name: clientName, conta_azul_code: cnpj, produto_json: productRow, pit_wall: pitWallRow };
 }
 
 // ---------- SCAN logic ----------
@@ -810,12 +880,28 @@ async function scanAndProcessTest(opts = {}) {
       const newValor = Number(c.valorMensal);
       const newDueDay = Number(c.diaVencimento || 10);
       if (existingSched) {
-        // Detecta upsell
-        const oldValue = existingSched.template?.total || 0;
-        const oldCategoryId = existingSched.template?.categoryId;
+        // Detecta upsell — usando valor BRUTO e categoryId REAIS (não o template.total, que vem
+        // LÍQUIDO de retenção de ISS, nem template.categoryId, que NÃO existe no payload de busca).
+        // Verificado ao vivo: MINATO template.total=3894.77 mas item bruto=4150 → comparar com
+        // template.total gerava upsell ESPÚRIO (PUT) a cada re-scan pós-restart. Por isso buscamos o
+        // estado real do scheduled-sale (GET) e o valor do item da próxima venda.
+        let oldGrossValue = null, oldCategoryId = null;
+        try {
+          const full = await caRequest('GET', `/app/v1/scheduled-sales/${existingSched.id}`);
+          if (full.status === 200 && full.body) {
+            oldCategoryId = full.body.categoryId || null;
+            if (full.body.saleId) {
+              const itR = await caRequest('GET', `/search-engine-core/v1/sales/${full.body.saleId}/items?page=1&page_size=10`);
+              const its = itR.body?.items || [];
+              oldGrossValue = Math.round(its.reduce((a, it) => a + (Number(it.value) || 0) * (Number(it.amount) || 1), 0) * 100) / 100;
+            }
+          }
+        } catch (e) { /* fallback abaixo */ }
+        // Fallback seguro: se não conseguiu o bruto, NÃO dispara upsell por valor (evita falso positivo).
         const newCategoryId = newProductMap?.cat;
-        const valueChanged = Math.abs(oldValue - newValor) > 0.01;
-        const productChanged = oldCategoryId && newCategoryId && oldCategoryId !== newCategoryId;
+        const valueChanged = oldGrossValue != null && Math.abs(oldGrossValue - newValor) > 0.01;
+        const productChanged = !!(oldCategoryId && newCategoryId && oldCategoryId !== newCategoryId);
+        const oldValue = oldGrossValue != null ? oldGrossValue : (existingSched.template?.total || 0);
         if (valueChanged || productChanged) {
           try {
             out.ca_upsell = await updateScheduledSaleForUpsell(
@@ -855,23 +941,61 @@ async function scanAndProcessTest(opts = {}) {
         try {
           out.ca_discount_result = await applyDiscountToFirstN(
             out.ca_scheduledSale.id, Number(c.descontoMeses), Number(c.descontoPercentual),
-            newValor, c.razaoSocial || ''
+            newValor, c.razaoSocial || '', out.ca_customer.id   // customerId p/ cross-check homônimo
           );
           const applied = out.ca_discount_result.applied?.length || 0;
-          await logAudit(ctx, 'ca_discount', 'apply', 'ok',
-            `Desconto ${c.descontoPercentual}% em ${c.descontoMeses} parcelas (applied=${applied})`,
+          const discErr = out.ca_discount_result.error;
+          await logAudit(ctx, 'ca_discount', 'apply', discErr ? 'error' : 'ok',
+            discErr
+              ? `Desconto NÃO aplicado: ${discErr} (${c.descontoPercentual}%/${c.descontoMeses}m)`
+              : `Desconto ${c.descontoPercentual}% em ${c.descontoMeses} parcelas (applied=${applied})`,
             out.ca_discount_result, tDisc);
         } catch (e) {
           out.ca_discount_error = e.message;
           await logAudit(ctx, 'ca_discount', 'apply', 'error', e.message, null, tDisc);
         }
+      } else if (Number(c.descontoMeses) > 0 || Number(c.descontoPercentual) > 0) {
+        // Só um dos dois veio preenchido (gap de dados no CRM) → não aplica, mas registra pra não passar batido.
+        out.ca_discount_skipped = `desconto incompleto: meses=${c.descontoMeses} pct=${c.descontoPercentual}`;
+        await logAudit(ctx, 'ca_discount', 'skip', 'pending',
+          `Desconto incompleto no CRM (meses=${c.descontoMeses}, pct=${c.descontoPercentual}) — não aplicado`, null, null);
       }
 
-      // 4) Setup manual (CA não permite DELETE via API)
+      // 4) Setup (venda avulsa). A CA NÃO permite DELETE via API → idempotência DURÁVEL é obrigatória.
+      //    Antes de criar, procuramos uma avulsa existente do cliente com o valor de setup
+      //    (findSetupSaleByCustomer). Se já existe → NÃO cria (evita duplicar a cada re-scan/restart).
+      //    Criação de fato só acontece com SETUP_AUTOCREATE=true (gate humano); senão só reporta.
       if (Number(c.valorImplementacao) > 0) {
-        out.ca_setup_pending = `Criar setup avulso R$ ${c.valorImplementacao} manualmente no painel CA Pro`;
-        await logAudit(ctx, 'ca_setup', 'skip', 'pending',
-          `Setup avulso R$ ${c.valorImplementacao} requer criação manual`, null, null);
+        const tSetup = Date.now();
+        try {
+          const existingSetup = await findSetupSaleByCustomer(
+            out.ca_customer.id, Number(c.valorImplementacao), c.razaoSocial || '');
+          if (existingSetup) {
+            // Idempotência durável: setup já existe (criado manual ou em scan anterior) → reusa.
+            out.ca_setup = { id: existingSetup.id, number: existingSetup.number, reused: true };
+            await logAudit(ctx, 'ca_setup', 'reuse', 'reused',
+              `Setup avulso R$ ${c.valorImplementacao} já existe na CA (#${existingSetup.number}) — não recria`,
+              { id: existingSetup.id }, tSetup);
+          } else if (SETUP_AUTOCREATE) {
+            // Não existe e autocreate ligado → cria a venda avulsa de setup.
+            out.ca_setup = await createSetupSale(out.ca_customer.id, {
+              produto: c.produto, valorImplementacao: Number(c.valorImplementacao),
+              dataAssinatura: c.autentiqueSignedAt || c.dataInicio || new Date().toISOString(),
+              sellerEmail: c.deal?.user?.email,
+            }, { testMode: false });
+            await logAudit(ctx, 'ca_setup', 'create', 'ok',
+              `Criado setup avulso R$ ${c.valorImplementacao} (#${out.ca_setup?.number})`,
+              out.ca_setup, tSetup);
+          } else {
+            // Não existe e autocreate desligado → mantém pendência (comportamento atual), mas auditável.
+            out.ca_setup_pending = `Criar setup avulso R$ ${c.valorImplementacao} (SETUP_AUTOCREATE off — manual no painel CA Pro)`;
+            await logAudit(ctx, 'ca_setup', 'skip', 'pending',
+              `Setup avulso R$ ${c.valorImplementacao} pendente (autocreate off; não encontrado na CA)`, null, tSetup);
+          }
+        } catch (e) {
+          out.ca_setup_error = e.message;
+          await logAudit(ctx, 'ca_setup', 'create', 'error', e.message, null, tSetup);
+        }
       }
 
       // 5) FinHub
@@ -908,7 +1032,34 @@ async function scanAndProcessTest(opts = {}) {
     results.push(out);
   }
 
-  return { scanned: r.body?.length || 0, eligible: eligible.length, skipped, results };
+  // 6) ADITIVOS (upsell) — visibilidade. Upsell na BGP é feito como Aditivo (SentDocument), e a tabela
+  //    NÃO persiste valor/produto estruturado (só HTML + metadata Autentique). Por isso NÃO dá pra
+  //    aplicar o upsell na CA automaticamente sem risco (não sabemos o novo valor). O que fazemos aqui é
+  //    DETECTAR aditivos assinados nas últimas 48h e emitir um ALERTA auditável → ação humana
+  //    (gerar Contract SIGNED com o novo valorMensal, ou usar /apply-discount//upsell manual).
+  //    Verificado ao vivo: 5 deals "Upsell N - X" (WON) tinham Contract em DRAFT/zero → nunca chegaram
+  //    ao pipeline; o conteúdo financeiro vivia só no aditivo. Sem este alerta, o upsell some.
+  let aditivos = [];
+  try {
+    const sinceAdit = new Date(Date.now() - 48 * 3600 * 1000).toISOString();
+    const aq = `?select=id,documentName,documentType,status,dealId,updatedAt,deal:Deal(id,title,status,organization:Organization(name,cnpj))&documentType=eq.aditivo&status=eq.signed&updatedAt=gte.${encodeURIComponent(sinceAdit)}&order=updatedAt.desc&limit=50`;
+    const ar = await crmRequest('GET', '/SentDocument' + aq);
+    if (ar.status === 200 && Array.isArray(ar.body)) {
+      for (const a of ar.body) {
+        const cnpjAdit = (a.deal?.organization?.cnpj || '').replace(/\D/g, '');
+        const ctxA = { run_id: uuid(), cnpj: cnpjAdit || null, client_name: a.deal?.organization?.name || a.deal?.title || a.documentName, crm_contract_id: null };
+        await logAudit(ctxA, 'aditivo_upsell', 'detect', 'pending',
+          `Aditivo assinado '${a.documentName}' (deal '${a.deal?.title}') — upsell NÃO aplicado automaticamente: ` +
+          `aditivo não persiste valor estruturado. Requer ação manual (gerar Contract SIGNED com novo valorMensal ou ajustar scheduled-sale).`,
+          { sent_document_id: a.id, deal_id: a.dealId, document: a.documentName }, null);
+        aditivos.push({ id: a.id, document: a.documentName, deal: a.deal?.title, cnpj: cnpjAdit, action_required: 'manual_upsell' });
+      }
+    }
+  } catch (e) {
+    console.warn('[aditivo-scan fail]', e.message);
+  }
+
+  return { scanned: r.body?.length || 0, eligible: eligible.length, skipped, results, aditivos_signed_48h: aditivos };
 }
 
 // Background poll (se SCAN_INTERVAL_SEC > 0)
@@ -929,11 +1080,28 @@ async function scanLoopOnce() {
 }
 
 // ---------- HTTP server ----------
-function checkAuth(req, res) {
+function checkAuth(req, res, opts = {}) {
   if (!ADMIN_TOKEN) return true; // dev mode
   const h = req.headers['authorization'] || '';
-  const m = h.match(/^Bearer\s+(.+)$/i);
-  if (m && m[1] === ADMIN_TOKEN) return true;
+  // Aceita Bearer (curl/api) E Basic (browser popup)
+  const bearer = h.match(/^Bearer\s+(.+)$/i);
+  if (bearer && bearer[1] === ADMIN_TOKEN) return true;
+  const basic = h.match(/^Basic\s+(.+)$/i);
+  if (basic) {
+    const dec = Buffer.from(basic[1], 'base64').toString('utf-8');
+    const colon = dec.indexOf(':');
+    const pw = colon >= 0 ? dec.slice(colon + 1) : dec;
+    if (pw === ADMIN_TOKEN) return true;
+  }
+  // Se for HTML route, manda WWW-Authenticate pro browser pedir creds
+  if (opts.allowBasic) {
+    res.writeHead(401, {
+      'WWW-Authenticate': 'Basic realm="CA Push Service"',
+      'Content-Type': 'text/plain; charset=utf-8',
+    });
+    res.end('Login: deixe usuario vazio, senha = ADMIN_TOKEN');
+    return false;
+  }
   res.writeHead(401, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'Unauthorized' }));
   return false;
