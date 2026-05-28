@@ -349,7 +349,7 @@ async function findSetupSaleByCustomer(customerId, valorSetup, searchTerm = '') 
   return null;
 }
 
-const SERVICE_VERSION = '2026-05-28T00:00:00Z-aditivo-automation+setup-source-dealproduct';
+const SERVICE_VERSION = "2026-05-28T20:00:00Z-discount-source-dealproduct";
 
 // ---------- AUDIT LOG ----------
 // Grava em FinHub.bgp_pipeline_audit. Se a tabela não existir, falha silenciosamente.
@@ -818,7 +818,7 @@ async function finhubCreateClient(payload) {
 async function crmDealProducts(dealId) {
   if (!dealId) return null;
   const r = await crmRequest('GET',
-    `/DealProduct?dealId=eq.${dealId}&select=setupPrice,setupInstallments,recurrenceValue,quantity,productId,product:Product(name)`);
+    `/DealProduct?dealId=eq.${dealId}&select=setupPrice,setupInstallments,recurrenceValue,quantity,discount,discountMonths,productId,product:Product(name)`);
   if (r.status !== 200 || !Array.isArray(r.body) || r.body.length === 0) return null;
   const products = r.body;
   const setupTotal = Math.round(products.reduce((s, p) =>
@@ -830,7 +830,10 @@ async function crmDealProducts(dealId) {
   const primary = products.find(p => Number(p.recurrenceValue || 0) > 0)
                || products.find(p => Number(p.setupPrice || 0) > 0)
                || products[0];
-  return { setupTotal, recurrenceTotal, setupInstallments, primaryProductName: primary?.product?.name || null, products };
+  // Desconto: maior discount entre os produtos (ou o do primary se único). discountMonths idem.
+  const discount = Math.max(...products.map(p => Number(p.discount || 0)), 0);
+  const discountMonths = Math.max(...products.map(p => Number(p.discountMonths || 0)), 0);
+  return { setupTotal, recurrenceTotal, setupInstallments, primaryProductName: primary?.product?.name || null, discount, discountMonths, products };
 }
 
 // Mapeia Product.name (vindo do CRM Product table) -> chave do PRODUCT_MAP (slug pra CA cat/cc).
@@ -912,7 +915,11 @@ async function scanAndProcessTest(opts = {}) {
       const contact = c.deal?.contact || {};
       const cnpj = (c.cnpj || org.cnpj || '').replace(/\D/g, '');
       ctx.cnpj = cnpj;
-      await logAudit(ctx, 'watcher_scan', 'attempt', 'pending', `Iniciando pipeline pra ${c.razaoSocial}`, { contract: c.id, produto: c.produto, valor: c.valorMensal });
+      // dp = fonte de verdade estruturada (setup + desconto). UI do card preenche DealProduct,
+      //      Contract pega NULL na maioria dos casos. Lê 1x e usa nas etapas 3.5 e 4.
+      let dp = null;
+      try { dp = await crmDealProducts(c.dealId); } catch { /* fallback Contract */ }
+      await logAudit(ctx, 'watcher_scan', 'attempt', 'pending', `Iniciando pipeline pra ${c.razaoSocial}`, { contract: c.id, produto: c.produto, valor: c.valorMensal, dp_summary: dp && { setupTotal: dp.setupTotal, recurrenceTotal: dp.recurrenceTotal, discount: dp.discount, discountMonths: dp.discountMonths } });
 
       // 2) Customer
       const tCust = Date.now();
@@ -993,30 +1000,41 @@ async function scanAndProcessTest(opts = {}) {
           `Criado scheduled-sale num ${out.ca_scheduledSale.number}`, out.ca_scheduledSale, tSched);
       }
 
-      // 3.5) Desconto
-      if (Number(c.descontoMeses) > 0 && Number(c.descontoPercentual) > 0) {
+      // 3.5) Desconto — FONTE PRIMÁRIA = DealProduct.discount/discountMonths (preenchida pela UI
+      //      do card de Deal). Fallback = Contract.descontoPercentual/descontoMeses. Auditado em
+      //      28/05/2026: nenhum Contract dos últimos 30d tinha descontoMeses preenchido, mas
+      //      DealProduct.discount estava ok pros casos com desconto.
+      const dpDisc = Number(dp?.discount || 0);
+      const dpMon  = Number(dp?.discountMonths || 0);
+      const cDisc  = Number(c.descontoPercentual || 0);
+      const cMon   = Number(c.descontoMeses || 0);
+      const descontoPct    = dpDisc > 0 ? dpDisc : cDisc;
+      const descontoMeses  = dpMon  > 0 ? dpMon  : cMon;
+      const descontoSource = (dpDisc > 0 || dpMon > 0) ? 'dealproduct' : 'contract';
+      if (descontoPct > 0 && descontoMeses > 0) {
         const tDisc = Date.now();
         try {
           out.ca_discount_result = await applyDiscountToFirstN(
-            out.ca_scheduledSale.id, Number(c.descontoMeses), Number(c.descontoPercentual),
-            newValor, c.razaoSocial || '', out.ca_customer.id   // customerId p/ cross-check homônimo
+            out.ca_scheduledSale.id, descontoMeses, descontoPct,
+            newValor, c.razaoSocial || '', out.ca_customer.id
           );
           const applied = out.ca_discount_result.applied?.length || 0;
           const discErr = out.ca_discount_result.error;
           await logAudit(ctx, 'ca_discount', 'apply', discErr ? 'error' : 'ok',
             discErr
-              ? `Desconto NÃO aplicado: ${discErr} (${c.descontoPercentual}%/${c.descontoMeses}m)`
-              : `Desconto ${c.descontoPercentual}% em ${c.descontoMeses} parcelas (applied=${applied})`,
-            out.ca_discount_result, tDisc);
+              ? `Desconto NÃO aplicado: ${discErr} (${descontoPct}%/${descontoMeses}m) [fonte=${descontoSource}]`
+              : `Desconto ${descontoPct}% em ${descontoMeses} parcelas (applied=${applied}) [fonte=${descontoSource}]`,
+            { ...out.ca_discount_result, source: descontoSource }, tDisc);
         } catch (e) {
           out.ca_discount_error = e.message;
           await logAudit(ctx, 'ca_discount', 'apply', 'error', e.message, null, tDisc);
         }
-      } else if (Number(c.descontoMeses) > 0 || Number(c.descontoPercentual) > 0) {
-        // Só um dos dois veio preenchido (gap de dados no CRM) → não aplica, mas registra pra não passar batido.
-        out.ca_discount_skipped = `desconto incompleto: meses=${c.descontoMeses} pct=${c.descontoPercentual}`;
+      } else if (descontoPct > 0 || descontoMeses > 0) {
+        // Só um dos dois veio preenchido → não aplica e registra (fica visível no monitor).
+        out.ca_discount_skipped = `desconto incompleto: meses=${descontoMeses} pct=${descontoPct} (dp=${dpDisc}/${dpMon} contract=${cDisc}/${cMon})`;
         await logAudit(ctx, 'ca_discount', 'skip', 'pending',
-          `Desconto incompleto no CRM (meses=${c.descontoMeses}, pct=${c.descontoPercentual}) — não aplicado`, null, null);
+          `Desconto incompleto: meses=${descontoMeses} pct=${descontoPct} — dp(${dpDisc}/${dpMon}) contract(${cDisc}/${cMon}) — preencher ambos no card pra liberar auto`,
+          null, null);
       }
 
       // 4) Setup (venda avulsa). FONTE = SUM(DealProduct.setupPrice) — é o que a equipe usa no
@@ -1025,13 +1043,10 @@ async function scanAndProcessTest(opts = {}) {
       //    Idempotência DURÁVEL via findSetupSaleByCustomer (CA não permite DELETE via API).
       let setupAmount = Number(c.valorImplementacao || 0);
       let setupSource = 'contract';
-      try {
-        const dp = await crmDealProducts(c.dealId);
-        if (dp && dp.setupTotal > 0) {
-          setupAmount = dp.setupTotal;
-          setupSource = 'dealproduct';
-        }
-      } catch { /* mantém fallback ao Contract.valorImplementacao */ }
+      if (dp && dp.setupTotal > 0) {
+        setupAmount = dp.setupTotal;
+        setupSource = 'dealproduct';
+      }
       if (setupAmount > 0) {
         const tSetup = Date.now();
         try {
