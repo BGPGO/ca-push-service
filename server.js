@@ -349,7 +349,7 @@ async function findSetupSaleByCustomer(customerId, valorSetup, searchTerm = '') 
   return null;
 }
 
-const SERVICE_VERSION = '2026-05-27T00:00:00Z-setup-idem+upsell-fix+aditivo-alert';
+const SERVICE_VERSION = '2026-05-28T00:00:00Z-aditivo-automation+setup-source-dealproduct';
 
 // ---------- AUDIT LOG ----------
 // Grava em FinHub.bgp_pipeline_audit. Se a tabela não existir, falha silenciosamente.
@@ -1316,7 +1316,7 @@ const server = http.createServer(async (req, res) => {
   };
 
   if (req.method === 'GET' && u.pathname === '/health') {
-    return send(200, { ok: true, ts: Date.now(), version: SERVICE_VERSION, kill_switch: KILL_SWITCH, gate_keyword: TESTE_KEYWORD || '(disabled — processa todos)' });
+    return send(200, { ok: true, ts: Date.now(), version: SERVICE_VERSION, kill_switch: KILL_SWITCH, gate_keyword: TESTE_KEYWORD || '(disabled — processa todos)', setup_autocreate: SETUP_AUTOCREATE, scan_interval_sec: SCAN_INTERVAL_SEC });
   }
 
   if (!checkAuth(req, res)) return;
