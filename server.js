@@ -812,6 +812,64 @@ async function finhubCreateClient(payload) {
   return { reused, fixed_ca_code: fixedCaCode, id: clientId, name: clientName, conta_azul_code: cnpj, produto_json: productRow, pit_wall: pitWallRow };
 }
 
+// ---------- ADITIVO helpers ----------
+// Aditivos (upsell) na BGP não persistem valor estruturado no SentDocument, mas SIM no DealProduct
+// (setupPrice + recurrenceValue) — fonte de verdade que a equipe usa quando aplica manual.
+async function crmDealProducts(dealId) {
+  if (!dealId) return null;
+  const r = await crmRequest('GET',
+    `/DealProduct?dealId=eq.${dealId}&select=setupPrice,setupInstallments,recurrenceValue,quantity,productId,product:Product(name)`);
+  if (r.status !== 200 || !Array.isArray(r.body) || r.body.length === 0) return null;
+  const products = r.body;
+  const setupTotal = Math.round(products.reduce((s, p) =>
+    s + Number(p.setupPrice || 0) * Number(p.quantity || 1), 0) * 100) / 100;
+  const recurrenceTotal = Math.round(products.reduce((s, p) =>
+    s + Number(p.recurrenceValue || 0) * Number(p.quantity || 1), 0) * 100) / 100;
+  const setupInstallments = products[0]?.setupInstallments || null;
+  // Produto primário = o que tem mais recorrência (define a categoria CA); senão o que tem setup
+  const primary = products.find(p => Number(p.recurrenceValue || 0) > 0)
+               || products.find(p => Number(p.setupPrice || 0) > 0)
+               || products[0];
+  return { setupTotal, recurrenceTotal, setupInstallments, primaryProductName: primary?.product?.name || null, products };
+}
+
+// Mapeia Product.name (vindo do CRM Product table) -> chave do PRODUCT_MAP (slug pra CA cat/cc).
+// Reusa convenção do produtoJsonName mas devolve a chave pra PRODUCT_MAP em vez do nome do JSON.
+function mapCrmProductNameToKey(productName) {
+  const p = String(productName || '').toLowerCase().replace(/[-_]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!p) return null;
+  if (p.includes('controladoria')) return 'bgp-go-iii'; // default level (cat é a mesma; cc default)
+  if (p.includes('go iii') || p.includes('go 3')) return 'bgp-go-iii';
+  if (p.includes('go ii') || p.includes('go 2')) return 'bgp-go-ii';
+  if (p.includes('go i') || p.includes('go 1')) return 'bgp-go-i';
+  if (p.includes('strategy') || p.includes('estrateg')) return 'bgp-strategy';
+  if (p.includes('valuation')) return 'bgp-valuation';
+  if (p.includes('brand') || p.includes('growth')) return 'brand-growth';
+  if (p.includes('aimo')) return 'go-aimo';
+  if (p.includes('condomin')) return 'gestao-condominial';
+  if (p.includes('bi')) return 'bgp-bi'; // BGP BI / BI Personalizado / BI GO
+  return null;
+}
+
+// Idempotência durável (via FinHub autentique_webhook_events.aditivo_applied_at).
+// Se o documento Autentique já foi processado (PUT na CA + setup) — não refaz. Restart-safe.
+async function finhubAditivoApplied(documentId) {
+  if (!documentId || !FINHUB_SERVICE_KEY) return false;
+  try {
+    const r = await finhubRest('GET',
+      `/autentique_webhook_events?document_id=eq.${encodeURIComponent(documentId)}&event_type=eq.signed&aditivo_applied_at=not.is.null&select=id&limit=1`);
+    return Array.isArray(r.body) && r.body.length > 0;
+  } catch { return false; }
+}
+async function markAditivoApplied(documentId, detail) {
+  if (!documentId || !FINHUB_SERVICE_KEY) return;
+  try {
+    await finhubRest('PATCH',
+      `/autentique_webhook_events?document_id=eq.${encodeURIComponent(documentId)}&event_type=eq.signed`,
+      { aditivo_applied_at: new Date().toISOString(), aditivo_applied_detail: detail });
+  } catch (e) { console.warn('[markAditivoApplied fail]', e.message); }
+}
+
 // ---------- SCAN logic ----------
 // Idempotency tracker in-memory (resets on restart, but CA /lookup acts as durable check)
 const processedContracts = new Set();
@@ -961,36 +1019,45 @@ async function scanAndProcessTest(opts = {}) {
           `Desconto incompleto no CRM (meses=${c.descontoMeses}, pct=${c.descontoPercentual}) — não aplicado`, null, null);
       }
 
-      // 4) Setup (venda avulsa). A CA NÃO permite DELETE via API → idempotência DURÁVEL é obrigatória.
-      //    Antes de criar, procuramos uma avulsa existente do cliente com o valor de setup
-      //    (findSetupSaleByCustomer). Se já existe → NÃO cria (evita duplicar a cada re-scan/restart).
-      //    Criação de fato só acontece com SETUP_AUTOCREATE=true (gate humano); senão só reporta.
-      if (Number(c.valorImplementacao) > 0) {
+      // 4) Setup (venda avulsa). FONTE = SUM(DealProduct.setupPrice) — é o que a equipe usa no
+      //    aplicação manual. Caso SHERPA: Contract.valorImplementacao=2500 mas DealProduct=2997
+      //    (equipe aplicou 2997). Se o Deal não tem DealProduct (raro), cai pra Contract.valorImplementacao.
+      //    Idempotência DURÁVEL via findSetupSaleByCustomer (CA não permite DELETE via API).
+      let setupAmount = Number(c.valorImplementacao || 0);
+      let setupSource = 'contract';
+      try {
+        const dp = await crmDealProducts(c.dealId);
+        if (dp && dp.setupTotal > 0) {
+          setupAmount = dp.setupTotal;
+          setupSource = 'dealproduct';
+        }
+      } catch { /* mantém fallback ao Contract.valorImplementacao */ }
+      if (setupAmount > 0) {
         const tSetup = Date.now();
         try {
           const existingSetup = await findSetupSaleByCustomer(
-            out.ca_customer.id, Number(c.valorImplementacao), c.razaoSocial || '');
+            out.ca_customer.id, setupAmount, c.razaoSocial || '');
           if (existingSetup) {
             // Idempotência durável: setup já existe (criado manual ou em scan anterior) → reusa.
-            out.ca_setup = { id: existingSetup.id, number: existingSetup.number, reused: true };
+            out.ca_setup = { id: existingSetup.id, number: existingSetup.number, reused: true, source: setupSource, value: setupAmount };
             await logAudit(ctx, 'ca_setup', 'reuse', 'reused',
-              `Setup avulso R$ ${c.valorImplementacao} já existe na CA (#${existingSetup.number}) — não recria`,
-              { id: existingSetup.id }, tSetup);
+              `Setup avulso R$ ${setupAmount} já existe na CA (#${existingSetup.number}) — não recria [fonte=${setupSource}]`,
+              { id: existingSetup.id, source: setupSource }, tSetup);
           } else if (SETUP_AUTOCREATE) {
             // Não existe e autocreate ligado → cria a venda avulsa de setup.
             out.ca_setup = await createSetupSale(out.ca_customer.id, {
-              produto: c.produto, valorImplementacao: Number(c.valorImplementacao),
+              produto: c.produto, valorImplementacao: setupAmount,
               dataAssinatura: c.autentiqueSignedAt || c.dataInicio || new Date().toISOString(),
               sellerEmail: c.deal?.user?.email,
             }, { testMode: false });
             await logAudit(ctx, 'ca_setup', 'create', 'ok',
-              `Criado setup avulso R$ ${c.valorImplementacao} (#${out.ca_setup?.number})`,
-              out.ca_setup, tSetup);
+              `Criado setup avulso R$ ${setupAmount} (#${out.ca_setup?.number}) [fonte=${setupSource}]`,
+              { ...(out.ca_setup || {}), source: setupSource }, tSetup);
           } else {
             // Não existe e autocreate desligado → mantém pendência (comportamento atual), mas auditável.
-            out.ca_setup_pending = `Criar setup avulso R$ ${c.valorImplementacao} (SETUP_AUTOCREATE off — manual no painel CA Pro)`;
+            out.ca_setup_pending = `Criar setup avulso R$ ${setupAmount} (SETUP_AUTOCREATE off — manual no painel CA Pro) [fonte=${setupSource}]`;
             await logAudit(ctx, 'ca_setup', 'skip', 'pending',
-              `Setup avulso R$ ${c.valorImplementacao} pendente (autocreate off; não encontrado na CA)`, null, tSetup);
+              `Setup avulso R$ ${setupAmount} pendente (autocreate off; não encontrado na CA) [fonte=${setupSource}]`, null, tSetup);
           }
         } catch (e) {
           out.ca_setup_error = e.message;
@@ -1032,27 +1099,161 @@ async function scanAndProcessTest(opts = {}) {
     results.push(out);
   }
 
-  // 6) ADITIVOS (upsell) — visibilidade. Upsell na BGP é feito como Aditivo (SentDocument), e a tabela
-  //    NÃO persiste valor/produto estruturado (só HTML + metadata Autentique). Por isso NÃO dá pra
-  //    aplicar o upsell na CA automaticamente sem risco (não sabemos o novo valor). O que fazemos aqui é
-  //    DETECTAR aditivos assinados nas últimas 48h e emitir um ALERTA auditável → ação humana
-  //    (gerar Contract SIGNED com o novo valorMensal, ou usar /apply-discount//upsell manual).
-  //    Verificado ao vivo: 5 deals "Upsell N - X" (WON) tinham Contract em DRAFT/zero → nunca chegaram
-  //    ao pipeline; o conteúdo financeiro vivia só no aditivo. Sem este alerta, o upsell some.
+  // 6) ADITIVOS (upsell) — PROCESSAMENTO COMPLETO. Aditivo na BGP = SentDocument com DealProduct
+  //    contendo o financeiro estruturado (setupPrice + recurrenceValue). Fluxo:
+  //    a) Setup: cria avulsa via createSetupSale (idempotência por findSetupSaleByCustomer +
+  //       SETUP_AUTOCREATE gate).
+  //    b) MRR upsell: lê valor BRUTO atual do scheduled-sale + soma DealProduct.recurrenceValue
+  //       → PUT com novo total (e troca categoria se Product mudou).
+  //    Idempotência durável: marca autentique_webhook_events.aditivo_applied_at no FinHub
+  //    (restart-safe; se a coluna estiver setada, skipa).
   let aditivos = [];
   try {
     const sinceAdit = new Date(Date.now() - 48 * 3600 * 1000).toISOString();
-    const aq = `?select=id,documentName,documentType,status,dealId,updatedAt,deal:Deal(id,title,status,organization:Organization(name,cnpj))&documentType=eq.aditivo&status=eq.signed&updatedAt=gte.${encodeURIComponent(sinceAdit)}&order=updatedAt.desc&limit=50`;
+    const aq = `?select=id,documentName,documentType,documentId,status,dealId,updatedAt,deal:Deal(id,title,status,organization:Organization(name,cnpj))&documentType=eq.aditivo&status=eq.signed&updatedAt=gte.${encodeURIComponent(sinceAdit)}&order=updatedAt.desc&limit=50`;
     const ar = await crmRequest('GET', '/SentDocument' + aq);
     if (ar.status === 200 && Array.isArray(ar.body)) {
       for (const a of ar.body) {
         const cnpjAdit = (a.deal?.organization?.cnpj || '').replace(/\D/g, '');
         const ctxA = { run_id: uuid(), cnpj: cnpjAdit || null, client_name: a.deal?.organization?.name || a.deal?.title || a.documentName, crm_contract_id: null };
-        await logAudit(ctxA, 'aditivo_upsell', 'detect', 'pending',
-          `Aditivo assinado '${a.documentName}' (deal '${a.deal?.title}') — upsell NÃO aplicado automaticamente: ` +
-          `aditivo não persiste valor estruturado. Requer ação manual (gerar Contract SIGNED com novo valorMensal ou ajustar scheduled-sale).`,
-          { sent_document_id: a.id, deal_id: a.dealId, document: a.documentName }, null);
-        aditivos.push({ id: a.id, document: a.documentName, deal: a.deal?.title, cnpj: cnpjAdit, action_required: 'manual_upsell' });
+        const aOut = { sent_document_id: a.id, document_id: a.documentId, document: a.documentName, deal: a.deal?.title, dealId: a.dealId, cnpj: cnpjAdit };
+        try {
+          // Idempotência durável (a coluna foi adicionada em 2026-05-28).
+          if (await finhubAditivoApplied(a.documentId)) {
+            aOut.skipped = 'already_applied';
+            aditivos.push(aOut);
+            continue;
+          }
+          const dp = await crmDealProducts(a.dealId);
+          if (!dp) {
+            aOut.error = 'no_deal_products';
+            await logAudit(ctxA, 'aditivo', 'parse', 'error',
+              `Aditivo '${a.documentName}' — DealProduct não encontrado pro deal ${a.dealId}`,
+              { sent_document_id: a.id }, null);
+            aditivos.push(aOut);
+            continue;
+          }
+          aOut.setupTotal = dp.setupTotal;
+          aOut.recurrenceTotal = dp.recurrenceTotal;
+          aOut.primaryProductName = dp.primaryProductName;
+          if (dp.setupTotal <= 0 && dp.recurrenceTotal <= 0) {
+            aOut.skipped = 'no_financial_value';
+            await logAudit(ctxA, 'aditivo', 'parse', 'skip',
+              `Aditivo '${a.documentName}' sem setup nem recorrência (deal ${a.dealId})`, dp, null);
+            aditivos.push(aOut);
+            continue;
+          }
+          const newProductKey = mapCrmProductNameToKey(dp.primaryProductName);
+          const newCatMap = newProductKey ? PRODUCT_MAP[newProductKey] : null;
+          // Localiza CA customer (por CNPJ; se não tiver, falha — aditivo sem cliente CA fica em pending pra revisão)
+          let customer = null;
+          if (cnpjAdit) customer = await findCustomerByCnpj(cnpjAdit);
+          if (!customer) {
+            aOut.error = `ca_customer_not_found cnpj=${cnpjAdit || 'null'}`;
+            await logAudit(ctxA, 'aditivo', 'customer', 'error',
+              `CA customer não localizado p/ aditivo (cnpj=${cnpjAdit || 'null'}, name=${ctxA.client_name})`,
+              { sent_document_id: a.id }, null);
+            aditivos.push(aOut);
+            continue;
+          }
+          const customerId = customer.id || customer.uuid;
+          aOut.ca_customer_id = customerId;
+          const searchTerm = a.deal?.organization?.name || ctxA.client_name;
+
+          // 6a) Setup (avulsa) — mesma idempotência + gate do fluxo Contract
+          if (dp.setupTotal > 0) {
+            const tSetup = Date.now();
+            try {
+              const existingSetup = await findSetupSaleByCustomer(customerId, dp.setupTotal, searchTerm);
+              if (existingSetup) {
+                aOut.ca_setup = { id: existingSetup.id, number: existingSetup.number, reused: true, value: dp.setupTotal };
+                await logAudit(ctxA, 'aditivo_setup', 'reuse', 'reused',
+                  `Setup R$${dp.setupTotal} já existe na CA (#${existingSetup.number})`,
+                  { id: existingSetup.id }, tSetup);
+              } else if (SETUP_AUTOCREATE) {
+                aOut.ca_setup = await createSetupSale(customerId, {
+                  produto: dp.primaryProductName || a.deal?.title || '',
+                  valorImplementacao: dp.setupTotal,
+                  dataAssinatura: a.updatedAt || new Date().toISOString(),
+                  sellerEmail: null,
+                }, { testMode: false });
+                await logAudit(ctxA, 'aditivo_setup', 'create', 'ok',
+                  `Setup R$${dp.setupTotal} criado via aditivo (#${aOut.ca_setup?.number})`,
+                  aOut.ca_setup, tSetup);
+              } else {
+                aOut.ca_setup_pending = `Criar setup R$${dp.setupTotal} (SETUP_AUTOCREATE off)`;
+                await logAudit(ctxA, 'aditivo_setup', 'skip', 'pending',
+                  `Setup R$${dp.setupTotal} via aditivo pendente (autocreate off)`, null, tSetup);
+              }
+            } catch (e) {
+              aOut.ca_setup_error = e.message;
+              await logAudit(ctxA, 'aditivo_setup', 'create', 'error', e.message, null, tSetup);
+            }
+          }
+
+          // 6b) MRR upsell (PUT scheduled-sale) — current_gross + recurrenceTotal = novoValor
+          if (dp.recurrenceTotal > 0) {
+            const tMRR = Date.now();
+            try {
+              const sched = await findScheduledSaleByCustomer(customerId, searchTerm);
+              if (!sched) {
+                aOut.ca_mrr_error = 'no_scheduled_sale';
+                await logAudit(ctxA, 'aditivo_mrr', 'lookup', 'error',
+                  `Sem scheduled-sale do cliente — não pode incrementar MRR`, null, tMRR);
+              } else {
+                let oldGross = null, oldCat = null, oldDueDay = 10;
+                const full = await caRequest('GET', `/app/v1/scheduled-sales/${sched.id}`);
+                if (full.status === 200 && full.body) {
+                  oldCat = full.body.categoryId || null;
+                  oldDueDay = full.body.paymentCondition?.dueDay || 10;
+                  if (full.body.saleId) {
+                    const itR = await caRequest('GET',
+                      `/search-engine-core/v1/sales/${full.body.saleId}/items?page=1&page_size=10`);
+                    const its = itR.body?.items || [];
+                    oldGross = Math.round(its.reduce((s, it) =>
+                      s + (Number(it.value) || 0) * (Number(it.amount) || 1), 0) * 100) / 100;
+                  }
+                }
+                if (oldGross == null || oldGross <= 0) {
+                  aOut.ca_mrr_error = 'cannot_read_current_gross';
+                  await logAudit(ctxA, 'aditivo_mrr', 'read', 'error',
+                    `Não foi possível ler bruto atual do scheduled-sale ${sched.id} — abort upsell`,
+                    { sched_id: sched.id }, tMRR);
+                } else if (!newProductKey || !newCatMap) {
+                  aOut.ca_mrr_error = `cannot_map_product:${dp.primaryProductName}`;
+                  await logAudit(ctxA, 'aditivo_mrr', 'map', 'error',
+                    `Não mapeou Product '${dp.primaryProductName}' p/ PRODUCT_MAP — abort upsell`,
+                    dp, tMRR);
+                } else {
+                  const novoValor = Math.round((oldGross + dp.recurrenceTotal) * 100) / 100;
+                  const productChanged = !!(oldCat && newCatMap.cat && oldCat !== newCatMap.cat);
+                  aOut.ca_mrr_upsell = await updateScheduledSaleForUpsell(
+                    sched.id, customerId, newProductKey, novoValor, oldDueDay, searchTerm
+                  );
+                  aOut.old_gross = oldGross;
+                  aOut.new_gross = novoValor;
+                  aOut.product_changed = productChanged;
+                  await logAudit(ctxA, 'aditivo_mrr', 'upsell', 'ok',
+                    `MRR upsell aditivo: ${oldGross} + ${dp.recurrenceTotal} = ${novoValor} (productChanged=${productChanged})`,
+                    aOut.ca_mrr_upsell, tMRR);
+                }
+              }
+            } catch (e) {
+              aOut.ca_mrr_error = e.message;
+              await logAudit(ctxA, 'aditivo_mrr', 'upsell', 'error', e.message, null, tMRR);
+            }
+          }
+
+          // Marca idempotência durável (mesmo com erro parcial — não tenta de novo automático)
+          aOut.ok = !aOut.ca_setup_error && !aOut.ca_mrr_error;
+          await markAditivoApplied(a.documentId, aOut);
+        } catch (e) {
+          aOut.ok = false;
+          aOut.error = e.message;
+          await logAudit(ctxA, 'aditivo', 'pipeline', 'error', e.message,
+            { stack: e.stack?.slice(0, 500) }, null);
+        }
+        aditivos.push(aOut);
       }
     }
   } catch (e) {
