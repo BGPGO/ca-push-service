@@ -349,7 +349,7 @@ async function findSetupSaleByCustomer(customerId, valorSetup, searchTerm = '') 
   return null;
 }
 
-const SERVICE_VERSION = "2026-05-28T20:00:00Z-discount-source-dealproduct";
+const SERVICE_VERSION = "2026-05-29T00:00:00Z-aditivo-finhub-sync";
 
 // ---------- AUDIT LOG ----------
 // Grava em FinHub.bgp_pipeline_audit. Se a tabela não existir, falha silenciosamente.
@@ -854,6 +854,41 @@ function mapCrmProductNameToKey(productName) {
   return null;
 }
 
+// Pós-aditivo: ajusta clients.produtos no FinHub (semântica DIFERENTE do finhubCreateClient).
+// finhubCreateClient faz push quando product_name muda → deixaria o produto antigo zumbi.
+// Aqui:
+//  - match por product_name → atualiza value;
+//  - sem match + productChanged + 1 produto na lista → REPLACE in-place (preserva id/responsible);
+//  - sem match + outros casos → push (ADD), pra humano revisar (caso multi-produto).
+async function finhubAdjustForAditivo({ cnpj, newProductName, newValueLiquido, productChanged }) {
+  if (!cnpj || !FINHUB_SERVICE_KEY) return { error: 'no_creds_or_cnpj' };
+  if (!newProductName) return { error: 'no_product_name_to_map' };
+  const cn = String(cnpj).replace(/\D/g, '');
+  const dup = await finhubRest('GET', `/clients?cnpj=eq.${cn}&select=id,name,produtos&limit=1`);
+  if (dup.status !== 200 || !Array.isArray(dup.body) || dup.body.length === 0) return { error: 'no_finhub_client' };
+  const client = dup.body[0];
+  let arr = Array.isArray(client.produtos) ? [...client.produtos] : [];
+  const target = newProductName.toLowerCase();
+  const idx = arr.findIndex(p => String(p.product_name || p.nome || p.name || '').toLowerCase() === target);
+  let action;
+  if (idx >= 0) {
+    if (newValueLiquido != null && Number(arr[idx].value) !== Number(newValueLiquido)) {
+      arr[idx] = { ...arr[idx], value: newValueLiquido };
+      action = 'value_updated';
+    } else action = 'noop';
+  } else if (productChanged && arr.length === 1) {
+    arr[0] = { ...arr[0], product_name: newProductName, value: newValueLiquido };
+    action = 'product_replaced_in_place';
+  } else {
+    arr.push({ product_name: newProductName, value: newValueLiquido, responsible: arr[0]?.responsible ?? null });
+    action = arr.length === 1 ? 'added_first' : 'added_multi_review';
+  }
+  const upd = await finhubRest('PATCH', `/clients?id=eq.${client.id}`, { produtos: arr });
+  return (upd.status >= 200 && upd.status < 300)
+    ? { client_id: client.id, action, produtos_count: arr.length, product_name: newProductName, value: newValueLiquido }
+    : { error: `PATCH ${upd.status}: ${JSON.stringify(upd.body).slice(0,200)}` };
+}
+
 // Idempotência durável (via FinHub autentique_webhook_events.aditivo_applied_at).
 // Se o documento Autentique já foi processado (PUT na CA + setup) — não refaz. Restart-safe.
 async function finhubAditivoApplied(documentId) {
@@ -1251,6 +1286,30 @@ async function scanAndProcessTest(opts = {}) {
                   await logAudit(ctxA, 'aditivo_mrr', 'upsell', 'ok',
                     `MRR upsell aditivo: ${oldGross} + ${dp.recurrenceTotal} = ${novoValor} (productChanged=${productChanged})`,
                     aOut.ca_mrr_upsell, tMRR);
+                  // 6c) FinHub: atualiza clients.produtos pro novo produto/valor (líquido).
+                  //      Lê template.total do CA pós-PUT (não dá pra reaproveitar `sched` — está stale).
+                  try {
+                    const refreshed = await caRequest('POST',
+                      '/contaazul-bff/sale/v1/scheduled-sales/searches?page=1&page_size=20',
+                      { totals: 'ENABLED', searchTerm });
+                    const updated = (refreshed.body?.items || []).find(it => it.id === sched.id);
+                    const newNet = Math.round(Number(updated?.template?.total || 0) * 100) / 100 || null;
+                    const newProductJsonName = produtoJsonName(newProductKey);
+                    aOut.finhub_produtos = await finhubAdjustForAditivo({
+                      cnpj: cnpjAdit,
+                      newProductName: newProductJsonName,
+                      newValueLiquido: newNet,
+                      productChanged,
+                    });
+                    await logAudit(ctxA, 'aditivo_finhub', 'sync', aOut.finhub_produtos?.error ? 'error' : 'ok',
+                      aOut.finhub_produtos?.error
+                        ? `FinHub produtos NÃO sincronizado: ${aOut.finhub_produtos.error}`
+                        : `FinHub produtos: ${aOut.finhub_produtos.action} → ${newProductJsonName} R$${newNet}`,
+                      aOut.finhub_produtos, null);
+                  } catch (e) {
+                    aOut.finhub_produtos_error = e.message;
+                    await logAudit(ctxA, 'aditivo_finhub', 'sync', 'error', e.message, null, null);
+                  }
                 }
               }
             } catch (e) {
