@@ -15,6 +15,19 @@ const CA_XAUTH = process.env.CA_XAUTH || '';
 const CA_BASE = 'https://services.contaazul.com';
 const ORIGIN = 'https://pro.contaazul.com';
 
+// ── API OFICIAL v2 (OAuth próprio, desacoplado do helper) — feature flag ──
+// Default OFF: enquanto false, tudo continua na API interna X-Auth (comportamento atual).
+const USE_OFFICIAL_API = String(process.env.USE_OFFICIAL_API || '').toLowerCase() === 'true';
+const CA_API_BASE = 'https://api-v2.contaazul.com';
+const CA_TOKEN_URL = 'https://auth.contaazul.com/oauth2/token';
+const CA_CLIENT_ID = process.env.CA_CLIENT_ID || '';
+const CA_CLIENT_SECRET = process.env.CA_CLIENT_SECRET || '';
+const CA_REFRESH_SEED = process.env.CA_REFRESH_TOKEN || ''; // semente p/ primeira boot (1x)
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+const OFFICIAL_TOKENS_FILE = path.join(DATA_DIR, '.ca-official-tokens.json');
+// API de enrich de CNPJ (endereço estruturado fallback + optante pelo Simples). Grátis, sem auth.
+const BRASILAPI_BASE = 'https://brasilapi.com.br/api';
+
 // CRM Supabase (origem dos dados do contrato assinado)
 const CRM_SUPABASE_URL = process.env.CRM_SUPABASE_URL || 'https://gqjgbwzxlqkwvrtorhvb.supabase.co';
 const CRM_SERVICE_KEY = process.env.CRM_SERVICE_KEY || '';
@@ -113,6 +126,114 @@ function caRequest(method, urlPath, body) {
   });
 }
 
+// ---------- API OFICIAL v2: OAuth próprio + request ----------
+// Request HTTPS genérico (host arbitrário) -> { status, body(JSON|string) }.
+function httpsJson(method, urlStr, headers, body) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr);
+    const data = body ? Buffer.from(typeof body === 'string' ? body : JSON.stringify(body)) : null;
+    const opts = { hostname: u.hostname, path: u.pathname + (u.search || ''), method, headers: { ...headers } };
+    if (data) opts.headers['Content-Length'] = data.length;
+    const req = https.request(opts, res => {
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => {
+        let raw = Buffer.concat(chunks);
+        const enc = (res.headers['content-encoding'] || '').toLowerCase();
+        try {
+          if (enc.includes('gzip')) raw = zlib.gunzipSync(raw);
+          else if (enc.includes('deflate')) raw = zlib.inflateSync(raw);
+        } catch {}
+        const txt = raw.toString('utf-8');
+        let parsed; try { parsed = JSON.parse(txt); } catch { parsed = txt; }
+        resolve({ status: res.statusCode, body: parsed });
+      });
+    });
+    req.on('error', reject);
+    if (data) req.write(data);
+    req.end();
+  });
+}
+
+function loadOfficialTokens() {
+  try { return JSON.parse(fs.readFileSync(OFFICIAL_TOKENS_FILE, 'utf-8')); } catch { return null; }
+}
+function saveOfficialTokens(t) {
+  try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
+  fs.writeFileSync(OFFICIAL_TOKENS_FILE, JSON.stringify(t, null, 2));
+  try { fs.chmodSync(OFFICIAL_TOKENS_FILE, 0o600); } catch {}
+}
+
+// Refresh do par OAuth (rotativo: grava o novo par sempre). Usa a semente do env na 1ª vez.
+async function refreshOfficialToken() {
+  if (!CA_CLIENT_ID || !CA_CLIENT_SECRET) throw new Error('CA_CLIENT_ID/SECRET ausentes (API oficial)');
+  const tk = loadOfficialTokens();
+  const refresh = (tk && tk.refresh_token) || CA_REFRESH_SEED;
+  if (!refresh) throw new Error('sem refresh_token (nem arquivo nem CA_REFRESH_TOKEN seed)');
+  const auth = Buffer.from(`${CA_CLIENT_ID}:${CA_CLIENT_SECRET}`).toString('base64');
+  const body = `grant_type=refresh_token&refresh_token=${encodeURIComponent(refresh)}`;
+  const r = await httpsJson('POST', CA_TOKEN_URL, {
+    'Authorization': `Basic ${auth}`,
+    'Content-Type': 'application/x-www-form-urlencoded',
+    'Accept': 'application/json',
+  }, body);
+  if (r.status !== 200 || !r.body || !r.body.access_token) {
+    throw new Error(`refresh oficial falhou ${r.status}: ${JSON.stringify(r.body).slice(0, 300)}`);
+  }
+  const out = r.body;
+  out.refresh_token = out.refresh_token || refresh; // se a CA não rotacionar, mantém o atual
+  out.expires_at = Date.now() + ((out.expires_in || 3600) * 1000) - 60000; // -60s de folga
+  out.obtained_at = new Date().toISOString();
+  saveOfficialTokens(out);
+  return out;
+}
+
+async function getOfficialAccessToken() {
+  let tk = loadOfficialTokens();
+  if (!tk || !tk.access_token || Date.now() >= (tk.expires_at || 0)) tk = await refreshOfficialToken();
+  return tk.access_token;
+}
+
+// Chamada à API oficial v2 (Bearer). Refaz 1x se 401 (token revogado/expirado na borda).
+async function caOfficialRequest(method, apiPath, body, _retried = false) {
+  const token = await getOfficialAccessToken();
+  const r = await httpsJson(method, CA_API_BASE + apiPath, {
+    'Authorization': `Bearer ${token}`,
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+  }, body);
+  if (r.status === 401 && !_retried) {
+    await refreshOfficialToken();
+    return caOfficialRequest(method, apiPath, body, true);
+  }
+  return r;
+}
+
+// Enrich por CNPJ (BrasilAPI): optante pelo Simples + endereço estruturado (fallback).
+// Read-only, melhor-esforço — nunca lança (retorna null em qualquer falha).
+async function enrichCnpjBrasilApi(cnpj) {
+  const digits = cleanCnpj(cnpj);
+  if (digits.length !== 14) return null;
+  try {
+    const r = await httpsJson('GET', `${BRASILAPI_BASE}/cnpj/v1/${digits}`, { 'Accept': 'application/json' });
+    if (r.status !== 200 || !r.body || typeof r.body !== 'object') return null;
+    const b = r.body;
+    return {
+      optante_simples: b.opcao_pelo_simples === true,
+      endereco: {
+        cep: (b.cep || '').replace(/\D/g, '') || null,
+        logradouro: [b.descricao_tipo_de_logradouro, b.logradouro].filter(Boolean).join(' ').trim() || b.logradouro || null,
+        numero: b.numero || null,
+        complemento: b.complemento || null,
+        bairro: b.bairro || null,
+        cidade: b.municipio || null,
+        estado: b.uf || null,
+      },
+      razao_social: b.razao_social || null,
+    };
+  } catch { return null; }
+}
+
 // ---------- Pipeline operations ----------
 function cleanCnpj(s) { return String(s || '').replace(/\D/g, ''); }
 function cleanPhone(s) {
@@ -182,6 +303,63 @@ async function createCustomer(c, opts) {
     legacyId: (r.body.legacyIds || [{}])[0]?.personLegacyId,
     created: true,
   };
+}
+
+// ── Versões OFICIAIS (API v2) — usadas quando USE_OFFICIAL_API=true ──
+async function findCustomerByCnpjOfficial(cnpj) {
+  const digits = cleanCnpj(cnpj);
+  const r = await caOfficialRequest('GET', `/v1/pessoas?busca=${digits}&tipo_perfil=Cliente&tamanho_pagina=10`);
+  if (r.status !== 200) return null;
+  const items = (r.body && r.body.items) || [];
+  const hit = items.find(p => cleanCnpj(p.documento) === digits) || items[0] || null;
+  return hit ? { id: hit.id, legacyId: hit.id_legado } : null;
+}
+
+async function createCustomerOfficial(c, opts) {
+  const cnpj = cleanCnpj(c.cnpj);
+  if (cnpj.length !== 14) throw new Error(`CNPJ inválido: '${c.cnpj}'`);
+
+  // Email financeiro é IMPERATIVO p/ envio da cobrança — não cair pro representante.
+  const emailFin = String(c.emailFinanceiro || '').trim();
+  if (!emailFin) throw new Error('emailFinanceiro ausente — obrigatório p/ cobrança (Conta Azul)');
+
+  // Enrich CNPJ (BrasilAPI): optante Simples + endereço fallback.
+  const enrich = await enrichCnpjBrasilApi(cnpj);
+  const ee = (enrich && enrich.endereco) || {};
+
+  // Endereço: prioriza o ESTRUTURADO vindo do CRM; fallback BrasilAPI.
+  const cep = String(c.cep || ee.cep || '').replace(/\D/g, '');
+  const logradouro = c.logradouro || ee.logradouro || '';
+  const numero = c.numeroEndereco || ee.numero || '';
+  const bairro = c.bairro || ee.bairro || '';
+  const cidade = c.cidade || ee.cidade || '';
+  const estado = c.estado || ee.estado || '';
+  if (cep.length !== 8 || !logradouro || !numero) {
+    throw new Error(`endereço incompleto (cep/logradouro/número) — obrigatório p/ cobrança. cep='${cep}'`);
+  }
+
+  const body = {
+    tipo_pessoa: 'Jurídica',
+    cnpj,
+    nome: (opts && opts.testMode ? '[TEST] ' : '') + (c.razaoSocial || c.nomeFantasia || 'Cliente'),
+    nome_fantasia: c.nomeFantasia || undefined,
+    optante_simples: enrich ? enrich.optante_simples : false,
+    email: c.email || emailFin,
+    telefone_comercial: cleanPhone(c.telefone || ''),
+    perfis: [{ tipo_perfil: 'Cliente' }],
+    enderecos: [{
+      cep, logradouro, numero,
+      complemento: c.complemento || ee.complemento || '',
+      bairro, cidade, estado, pais: 'Brasil',
+    }],
+    contato_cobranca_faturamento: { emails: [emailFin] },
+  };
+
+  const r = await caOfficialRequest('POST', '/v1/pessoas', body);
+  if (r.status !== 201 || !r.body || !r.body.id) {
+    throw new Error(`createCustomerOfficial falhou ${r.status}: ${JSON.stringify(r.body).slice(0, 400)}`);
+  }
+  return { id: r.body.id, legacyId: r.body.id_legado, created: true };
 }
 
 async function calcTaxes(value) {
