@@ -252,6 +252,7 @@ function fmtCnpj(s) {
 }
 
 async function findCustomerByCnpj(cnpj) {
+  if (USE_OFFICIAL_API) return findCustomerByCnpjOfficial(cnpj);
   const r = await caRequest('GET',
     `/contaazul-bff/person-registration/v2/persons?search_term=${encodeURIComponent(cnpj)}&page=1&page_size=20&profile_type=CUSTOMER&person_status=active&recover_legacy_id=true&textual_search_only=true`);
   if (r.status !== 200 || !r.body) return null;
@@ -265,6 +266,7 @@ async function findCustomerByCnpj(cnpj) {
 }
 
 async function createCustomer(c, opts) {
+  if (USE_OFFICIAL_API) return createCustomerOfficial(c, opts);
   const cnpj = cleanCnpj(c.cnpj);
   const body = {
     personType: 'Jurídica',
@@ -360,6 +362,98 @@ async function createCustomerOfficial(c, opts) {
     throw new Error(`createCustomerOfficial falhou ${r.status}: ${JSON.stringify(r.body).slice(0, 400)}`);
   }
   return { id: r.body.id, legacyId: r.body.id_legado, created: true };
+}
+
+async function createScheduledSaleOficial(customerId, contract, opts) {
+  const productKey = normalizeProductKey(contract.produto);
+  const map = PRODUCT_MAP[productKey];
+  if (!map) throw new Error(`Produto desconhecido: '${contract.produto}' (norm '${productKey}')`);
+  const sellerId = SELLER_MAP[(contract.sellerEmail || '').toLowerCase()] || DEFAULTS.sellerId;
+  const valor = Number(contract.valorMensal);
+  if (!valor || valor <= 0) throw new Error(`valorMensal inválido: ${contract.valorMensal}`);
+
+  const dueDay = parseInt(contract.diaVencimento, 10) || 5;
+  const startDate = String(contract.dataInicio || contract.dataAssinatura || new Date().toISOString()).slice(0, 10);
+  // FIX #1: data da 1ª parcela = a definida pelo comercial (campo estruturado do CRM).
+  // Fallback = primeiro diaVencimento em/após a data de início (NUNCA derivar da assinatura).
+  const primeiraParcela = contract.dataPrimeiraParcela
+    ? String(contract.dataPrimeiraParcela).slice(0, 10)
+    : firstDueAfter(startDate, dueDay);
+  // data_fim é obrigatória mesmo com expiração NUNCA (regra da v2) — 5 anos à frente.
+  const endD = new Date(startDate); endD.setUTCFullYear(endD.getUTCFullYear() + 5);
+  const endDate = endD.toISOString().slice(0, 10);
+
+  const nn = await caOfficialRequest('GET', '/v1/contratos/proximo-numero');
+  const numero = typeof nn.body === 'number' ? nn.body : Number(nn.body && (nn.body.data || nn.body.number));
+  if (!numero) throw new Error(`proximo-numero contrato inválido: ${JSON.stringify(nn.body).slice(0, 120)}`);
+
+  const body = {
+    id_cliente: customerId,
+    id_categoria: map.cat,
+    id_centro_custo: map.cc,
+    id_vendedor: sellerId,
+    itens: [{ id: DEFAULTS.serviceIdNfse, quantidade: 1, valor }],
+    condicao_pagamento: {
+      tipo_pagamento: 'BOLETO_BANCARIO',
+      id_conta_financeira: DEFAULTS.financialAccountId,
+      dia_vencimento: dueDay,
+      primeira_data_vencimento: primeiraParcela,
+    },
+    termos: {
+      numero,
+      tipo_frequencia: 'MENSAL',
+      intervalo_frequencia: 1,
+      tipo_expiracao: 'NUNCA',
+      data_inicio: startDate,
+      data_fim: endDate,
+      dia_emissao_venda: 1,
+    },
+    observacoes: opts && opts.testMode ? 'TEST E2E CRM — apagar' : `Contrato BGPGO — ${contract.produto}`,
+  };
+
+  const r = await caOfficialRequest('POST', '/v1/contratos', body);
+  if (r.status !== 201 || !r.body || !r.body.id) {
+    throw new Error(`createScheduledSaleOficial falhou ${r.status}: ${JSON.stringify(r.body).slice(0, 600)}`);
+  }
+  return { id: r.body.id, legacyId: r.body.id_legado, number: numero, firstDueDate: primeiraParcela, idVenda: r.body.id_venda };
+}
+
+async function createSetupSaleOficial(customerId, contract, opts) {
+  const valor = Number(contract.valorImplementacao);
+  if (!valor || valor <= 0) return null;
+  const productKey = normalizeProductKey(contract.produto);
+  const map = PRODUCT_MAP[productKey];
+  if (!map) throw new Error(`Produto desconhecido: '${contract.produto}'`);
+  const sellerId = SELLER_MAP[(contract.sellerEmail || '').toLowerCase()] || DEFAULTS.sellerId;
+  const committedDate = String(contract.dataAssinatura || new Date().toISOString()).slice(0, 10);
+
+  const nn = await caOfficialRequest('GET', '/v1/venda/proximo-numero');
+  const numero = typeof nn.body === 'number' ? nn.body : Number(nn.body && (nn.body.data || nn.body.number));
+  if (!numero) throw new Error(`proximo-numero venda inválido: ${JSON.stringify(nn.body).slice(0, 120)}`);
+
+  const body = {
+    id_cliente: customerId,
+    numero,
+    situacao: 'APROVADO',
+    data_venda: committedDate,
+    id_categoria: map.cat,
+    id_centro_custo: map.cc,
+    id_vendedor: sellerId,
+    itens: [{ id: DEFAULTS.serviceIdNfse, quantidade: 1, valor, descricao: 'Setup / implementacao' }],
+    condicao_pagamento: {
+      tipo_pagamento: 'BOLETO_BANCARIO',
+      id_conta_financeira: DEFAULTS.financialAccountId,
+      opcao_condicao_pagamento: 'À vista',
+      parcelas: [{ data_vencimento: committedDate, valor }],
+    },
+    observacoes: opts && opts.testMode ? 'TEST E2E CRM Setup — apagar' : `Setup ${contract.produto}`,
+  };
+
+  const r = await caOfficialRequest('POST', '/v1/venda', body);
+  if ((r.status !== 200 && r.status !== 201) || !r.body || !r.body.id) {
+    throw new Error(`createSetupSaleOficial falhou ${r.status}: ${JSON.stringify(r.body).slice(0, 600)}`);
+  }
+  return { id: r.body.id, legacyId: r.body.id_legado, number: r.body.numero || numero };
 }
 
 async function calcTaxes(value) {
@@ -682,6 +776,7 @@ async function applyDiscountToFirstN(schedId, descontoMeses, descontoPercentual,
 }
 
 async function createScheduledSale(customerId, contract, opts) {
+  if (USE_OFFICIAL_API) return createScheduledSaleOficial(customerId, contract, opts);
   const productKey = normalizeProductKey(contract.produto);
   const map = PRODUCT_MAP[productKey];
   if (!map) throw new Error(`Produto desconhecido: '${contract.produto}' (normalizado: '${productKey}'). Conhecidos: ${Object.keys(PRODUCT_MAP).join(', ')}`);
@@ -773,6 +868,7 @@ async function createScheduledSale(customerId, contract, opts) {
 }
 
 async function createSetupSale(customerId, contract, opts) {
+  if (USE_OFFICIAL_API) return createSetupSaleOficial(customerId, contract, opts);
   const valor = Number(contract.valorImplementacao);
   if (!valor || valor <= 0) return null;
 
@@ -1156,8 +1252,13 @@ async function scanAndProcessTest(opts = {}) {
           cnpj, razaoSocial: c.razaoSocial, nomeFantasia: c.nomeFantasia || '',
           email: c.emailRepresentante || contact.email || '',
           telefone: contact.phone || org.phone || '',
-          emailFinanceiro: c.emailFinanceiro || c.emailRepresentante,
+          // emailFinanceiro RAW (sem cair pro representante) — a versão oficial exige; a interna
+          // tem seu próprio fallback (|| c.email) internamente.
+          emailFinanceiro: c.emailFinanceiro || '',
           endereco: c.endereco || '',
+          // endereço estruturado (FIX #2) — usado pela versão oficial em enderecos[]
+          cep: c.cep || '', logradouro: c.logradouro || '', numeroEndereco: c.numeroEndereco || '',
+          complemento: c.complemento || '', bairro: c.bairro || '', cidade: c.cidade || '', estado: c.estado || '',
         }, { testMode: false });
         await logAudit(ctx, 'ca_customer', 'create', 'ok', `Criado cliente CA ${out.ca_customer.id}`, out.ca_customer, tCust);
       }
@@ -1218,7 +1319,8 @@ async function scanAndProcessTest(opts = {}) {
         out.ca_scheduledSale = await createScheduledSale(out.ca_customer.id, {
           produto: c.produto, valorMensal: newValor, diaVencimento: newDueDay,
           dataAssinatura: c.autentiqueSignedAt || c.dataInicio || new Date().toISOString(),
-          // FIX: data da 1ª parcela definida pelo comercial no contrato (campo estruturado do CRM)
+          // FIX #1: início = dataInicio do CRM; 1ª parcela = campo estruturado dataPrimeiraParcela
+          dataInicio: c.dataInicio || null,
           dataPrimeiraParcela: c.dataPrimeiraParcela || null,
           sellerEmail: c.deal?.user?.email,
         }, { testMode: false });
