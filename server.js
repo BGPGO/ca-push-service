@@ -515,10 +515,19 @@ async function createScheduledSale(customerId, contract, opts) {
   const tax = await calcTaxes(valor);
   const nextNum = await nextContractNumber();
 
-  const emissionDate = firstDayNextMonth(contract.dataAssinatura);
   const startDate = String(contract.dataAssinatura).slice(0, 10);
   const dueDay = parseInt(contract.diaVencimento, 10) || 5;
-  const firstDueDate = firstDueAfter(emissionDate, dueDay);
+  // FIX data da 1ª parcela: se o comercial definiu a data no contrato (dataPrimeiraParcela),
+  // respeita ela (pode ser mais pra frente). Senão, mantém o comportamento antigo.
+  let emissionDate, firstDueDate;
+  if (contract.dataPrimeiraParcela) {
+    firstDueDate = String(contract.dataPrimeiraParcela).slice(0, 10);
+    const d = new Date(firstDueDate);
+    emissionDate = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1)).toISOString().slice(0, 10);
+  } else {
+    emissionDate = firstDayNextMonth(contract.dataAssinatura);
+    firstDueDate = firstDueAfter(emissionDate, dueDay);
+  }
   // endDate: mesmo em FOREVER a CA exige um valor. Coloca 11 meses pra frente do start.
   const endD = new Date(startDate);
   endD.setUTCMonth(endD.getUTCMonth() + 11);
@@ -1031,6 +1040,8 @@ async function scanAndProcessTest(opts = {}) {
         out.ca_scheduledSale = await createScheduledSale(out.ca_customer.id, {
           produto: c.produto, valorMensal: newValor, diaVencimento: newDueDay,
           dataAssinatura: c.autentiqueSignedAt || c.dataInicio || new Date().toISOString(),
+          // FIX: data da 1ª parcela definida pelo comercial no contrato (campo estruturado do CRM)
+          dataPrimeiraParcela: c.dataPrimeiraParcela || null,
           sellerEmail: c.deal?.user?.email,
         }, { testMode: false });
         await logAudit(ctx, 'ca_scheduled_sale', 'create', 'ok',
