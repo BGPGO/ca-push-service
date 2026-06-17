@@ -59,6 +59,8 @@ const PRODUCT_MAP = {
   'bgp-valuation': { cc: '1ac117e4-37fe-11f0-9c0c-4f3d632514d2', cat: 'a882d0ea-5f90-422c-b613-6e6cb71f0260' },
   'brand-growth': { cc: '396de6fa-d05a-11f0-a205-f7c9cebf091f', cat: '7ca280ae-c469-4ff4-b2ae-e59099f45395' },
   'go-aimo': { cc: 'ac220d00-2160-11f1-977a-2ba7c1fffab6', cat: 'a66f45bf-8600-4640-9a97-ebe9f4b63e29' },
+  // GO BI by AiMO — receita atribuída a GO AIMO (cc + categoria), decisão Thomas 17/06
+  'go-bi-by-aimo': { cc: 'ac220d00-2160-11f1-977a-2ba7c1fffab6', cat: 'a66f45bf-8600-4640-9a97-ebe9f4b63e29' },
   'gestao-condominial': { cc: '4dc1ef9e-3b26-11f0-ac84-4f62813feeba', cat: 'd3464540-e64c-4494-9025-99ff5c7d001e' },
 };
 
