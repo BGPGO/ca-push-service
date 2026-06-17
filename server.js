@@ -210,8 +210,8 @@ function fmtCnpj(s) {
   return `${c.slice(0,2)}.${c.slice(2,5)}.${c.slice(5,8)}/${c.slice(8,12)}-${c.slice(12)}`;
 }
 
-async function findCustomerByCnpj(cnpj) {
-  if (USE_OFFICIAL_API) return findCustomerByCnpjOfficial(cnpj);
+async function findCustomerByCnpj(cnpj, useOfficial = false) {
+  if (USE_OFFICIAL_API || useOfficial) return findCustomerByCnpjOfficial(cnpj);
   const r = await caRequest('GET',
     `/contaazul-bff/person-registration/v2/persons?search_term=${encodeURIComponent(cnpj)}&page=1&page_size=20&profile_type=CUSTOMER&person_status=active&recover_legacy_id=true&textual_search_only=true`);
   if (r.status !== 200 || !r.body) return null;
@@ -225,7 +225,7 @@ async function findCustomerByCnpj(cnpj) {
 }
 
 async function createCustomer(c, opts) {
-  if (USE_OFFICIAL_API) return createCustomerOfficial(c, opts);
+  if (USE_OFFICIAL_API || (opts && opts.useOfficial)) return createCustomerOfficial(c, opts);
   const cnpj = cleanCnpj(c.cnpj);
   const body = {
     personType: 'Jurídica',
@@ -735,7 +735,7 @@ async function applyDiscountToFirstN(schedId, descontoMeses, descontoPercentual,
 }
 
 async function createScheduledSale(customerId, contract, opts) {
-  if (USE_OFFICIAL_API) return createScheduledSaleOficial(customerId, contract, opts);
+  if (USE_OFFICIAL_API || (opts && opts.useOfficial)) return createScheduledSaleOficial(customerId, contract, opts);
   const productKey = normalizeProductKey(contract.produto);
   const map = PRODUCT_MAP[productKey];
   if (!map) throw new Error(`Produto desconhecido: '${contract.produto}' (normalizado: '${productKey}'). Conhecidos: ${Object.keys(PRODUCT_MAP).join(', ')}`);
@@ -827,7 +827,7 @@ async function createScheduledSale(customerId, contract, opts) {
 }
 
 async function createSetupSale(customerId, contract, opts) {
-  if (USE_OFFICIAL_API) return createSetupSaleOficial(customerId, contract, opts);
+  if (USE_OFFICIAL_API || (opts && opts.useOfficial)) return createSetupSaleOficial(customerId, contract, opts);
   const valor = Number(contract.valorImplementacao);
   if (!valor || valor <= 0) return null;
 
@@ -1194,6 +1194,13 @@ async function scanAndProcessTest(opts = {}) {
       const contact = c.deal?.contact || {};
       const cnpj = (c.cnpj || org.cnpj || '').replace(/\D/g, '');
       ctx.cnpj = cnpj;
+      // 🐤 CANARY por nome: deal/lead começando com "teste" → roteia pra API OFICIAL v2
+      // (testa a v2 em produção real sem ligar o flag global). Os demais seguem no interno (X-Auth).
+      const isTest = [c.razaoSocial, c.deal?.title, c.deal?.organization?.name, c.nomeFantasia]
+        .filter(Boolean).some(s => String(s).trim().toLowerCase().startsWith('teste'));
+      const useOfficial = USE_OFFICIAL_API || isTest;
+      out.routed_to = useOfficial ? 'oficial_v2' : 'interna';
+      if (isTest) await logAudit(ctx, 'route', 'canary', 'ok', `Nome "teste*" → roteado pra API OFICIAL v2`, { useOfficial }, null);
       // dp = fonte de verdade estruturada (setup + desconto). UI do card preenche DealProduct,
       //      Contract pega NULL na maioria dos casos. Lê 1x e usa nas etapas 3.5 e 4.
       let dp = null;
@@ -1202,7 +1209,7 @@ async function scanAndProcessTest(opts = {}) {
 
       // 2) Customer
       const tCust = Date.now();
-      const existing = await findCustomerByCnpj(cnpj);
+      const existing = await findCustomerByCnpj(cnpj, useOfficial);
       if (existing) {
         out.ca_customer = { id: existing.id || existing.uuid, reused: true };
         await logAudit(ctx, 'ca_customer', 'reuse', 'reused', `Cliente já existe na CA (${existing.id || existing.uuid})`, { ca_id: existing.id }, tCust);
@@ -1218,7 +1225,7 @@ async function scanAndProcessTest(opts = {}) {
           // endereço estruturado (FIX #2) — usado pela versão oficial em enderecos[]
           cep: c.cep || '', logradouro: c.logradouro || '', numeroEndereco: c.numeroEndereco || '',
           complemento: c.complemento || '', bairro: c.bairro || '', cidade: c.cidade || '', estado: c.estado || '',
-        }, { testMode: false });
+        }, { testMode: isTest, useOfficial });
         await logAudit(ctx, 'ca_customer', 'create', 'ok', `Criado cliente CA ${out.ca_customer.id}`, out.ca_customer, tCust);
       }
 
@@ -1282,7 +1289,7 @@ async function scanAndProcessTest(opts = {}) {
           dataInicio: c.dataInicio || null,
           dataPrimeiraParcela: c.dataPrimeiraParcela || null,
           sellerEmail: c.deal?.user?.email,
-        }, { testMode: false });
+        }, { testMode: isTest, useOfficial });
         await logAudit(ctx, 'ca_scheduled_sale', 'create', 'ok',
           `Criado scheduled-sale num ${out.ca_scheduledSale.number}`, out.ca_scheduledSale, tSched);
       }
@@ -1351,7 +1358,7 @@ async function scanAndProcessTest(opts = {}) {
               produto: c.produto, valorImplementacao: setupAmount,
               dataAssinatura: c.autentiqueSignedAt || c.dataInicio || new Date().toISOString(),
               sellerEmail: c.deal?.user?.email,
-            }, { testMode: false });
+            }, { testMode: isTest, useOfficial });
             await logAudit(ctx, 'ca_setup', 'create', 'ok',
               `Criado setup avulso R$ ${setupAmount} (#${out.ca_setup?.number}) [fonte=${setupSource}]`,
               { ...(out.ca_setup || {}), source: setupSource }, tSetup);
