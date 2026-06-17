@@ -7,7 +7,6 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
-const crypto = require('crypto');
 const { URL } = require('url');
 
 const PORT = parseInt(process.env.PORT || '5455', 10);
@@ -16,17 +15,13 @@ const CA_XAUTH = process.env.CA_XAUTH || '';
 const CA_BASE = 'https://services.contaazul.com';
 const ORIGIN = 'https://pro.contaazul.com';
 
-// ── API OFICIAL v2 (OAuth próprio, desacoplado do helper) — feature flag ──
+// ── API OFICIAL v2 (via helper ca-oauth) — feature flag ──
 // Default OFF: enquanto false, tudo continua na API interna X-Auth (comportamento atual).
+// Quando ON, as criações vão pra API oficial v2 ATRAVÉS do helper ca-oauth (que já tem o
+// token OAuth e renova sozinho) — sem OAuth/credencial próprios aqui.
 const USE_OFFICIAL_API = String(process.env.USE_OFFICIAL_API || '').toLowerCase() === 'true';
-const CA_API_BASE = 'https://api-v2.contaazul.com';
-const CA_TOKEN_URL = 'https://auth.contaazul.com/oauth2/token';
-const CA_AUTH_BASE = 'https://auth.contaazul.com/oauth2/authorize';
-const CA_SCOPE = 'openid profile aws.cognito.signin.user.admin';
-const CA_CLIENT_ID = process.env.CA_CLIENT_ID || '';
-const CA_CLIENT_SECRET = process.env.CA_CLIENT_SECRET || '';
-const CA_REDIRECT_URI = process.env.CA_REDIRECT_URI || ''; // redirect do ca-push (cadastrar no portal)
-const CA_REFRESH_SEED = process.env.CA_REFRESH_TOKEN || ''; // semente opcional (fallback)
+const HELPER_URL = (process.env.HELPER_URL || 'https://ca-oauth.187.77.238.125.sslip.io').replace(/\/$/, '');
+const HELPER_ADMIN_TOKEN = process.env.HELPER_ADMIN_TOKEN || '';
 // API de enrich de CNPJ (endereço estruturado fallback + optante pelo Simples). Grátis, sem auth.
 const BRASILAPI_BASE = 'https://brasilapi.com.br/api';
 
@@ -157,96 +152,20 @@ function httpsJson(method, urlStr, headers, body) {
   });
 }
 
-// Token guardado no Supabase do FinHub (tabela ca_push_oauth_tokens, singleton id=1) —
-// sobrevive a redeploy SEM precisar de volume no Coolify.
-async function loadOfficialTokens() {
-  try {
-    const r = await finhubRest('GET', '/ca_push_oauth_tokens?id=eq.1&select=*');
-    const row = Array.isArray(r.body) ? r.body[0] : null;
-    if (!row || !row.refresh_token) return null;
-    return {
-      access_token: row.access_token,
-      refresh_token: row.refresh_token,
-      expires_at: Number(row.expires_at) || 0,
-      obtained_at: row.obtained_at,
-    };
-  } catch { return null; }
-}
-async function saveOfficialTokens(t) {
-  await finhubRest('PATCH', '/ca_push_oauth_tokens?id=eq.1', {
-    access_token: t.access_token,
-    refresh_token: t.refresh_token,
-    expires_at: t.expires_at,
-    obtained_at: t.obtained_at || new Date().toISOString(),
-    updated_at: new Date().toISOString(),
-  });
-}
-
-// Refresh do par OAuth (rotativo: grava o novo par sempre). Usa a semente do env na 1ª vez.
-async function refreshOfficialToken() {
-  if (!CA_CLIENT_ID || !CA_CLIENT_SECRET) throw new Error('CA_CLIENT_ID/SECRET ausentes (API oficial)');
-  const tk = await loadOfficialTokens();
-  const refresh = (tk && tk.refresh_token) || CA_REFRESH_SEED;
-  if (!refresh) throw new Error('sem refresh_token (conecte a Conta Azul em /conectar)');
-  const auth = Buffer.from(`${CA_CLIENT_ID}:${CA_CLIENT_SECRET}`).toString('base64');
-  const body = `grant_type=refresh_token&refresh_token=${encodeURIComponent(refresh)}`;
-  const r = await httpsJson('POST', CA_TOKEN_URL, {
+// Chamada à API oficial v2 ATRAVÉS do helper ca-oauth (que detém o token OAuth e o renova
+// sozinho). O helper expõe GET|POST /api?path=/v1/... (Basic auth = ADMIN_TOKEN) e repassa
+// pra api-v2.contaazul.com, devolvendo o status REAL da Conta Azul. Sem credencial própria aqui.
+async function caOfficialRequest(method, apiPath, body) {
+  if (!HELPER_ADMIN_TOKEN) throw new Error('HELPER_ADMIN_TOKEN ausente (configurar no Coolify)');
+  const [basePath, query] = apiPath.split('?');
+  let helperUrl = `${HELPER_URL}/api?path=${encodeURIComponent(basePath)}`;
+  if (query) helperUrl += `&${query}`;
+  const auth = Buffer.from(`admin:${HELPER_ADMIN_TOKEN}`).toString('base64');
+  return httpsJson(method, helperUrl, {
     'Authorization': `Basic ${auth}`,
-    'Content-Type': 'application/x-www-form-urlencoded',
-    'Accept': 'application/json',
-  }, body);
-  if (r.status !== 200 || !r.body || !r.body.access_token) {
-    throw new Error(`refresh oficial falhou ${r.status}: ${JSON.stringify(r.body).slice(0, 300)}`);
-  }
-  const out = r.body;
-  out.refresh_token = out.refresh_token || refresh; // se a CA não rotacionar, mantém o atual
-  out.expires_at = Date.now() + ((out.expires_in || 3600) * 1000) - 60000; // -60s de folga
-  out.obtained_at = new Date().toISOString();
-  await saveOfficialTokens(out);
-  return out;
-}
-
-// Troca o authorization_code (do /oauth/callback) pelo 1º par de tokens e salva.
-async function exchangeCodeOfficial(code) {
-  if (!CA_CLIENT_ID || !CA_CLIENT_SECRET || !CA_REDIRECT_URI) {
-    throw new Error('CA_CLIENT_ID/CA_CLIENT_SECRET/CA_REDIRECT_URI ausentes');
-  }
-  const auth = Buffer.from(`${CA_CLIENT_ID}:${CA_CLIENT_SECRET}`).toString('base64');
-  const body = `grant_type=authorization_code&code=${encodeURIComponent(code)}&redirect_uri=${encodeURIComponent(CA_REDIRECT_URI)}`;
-  const r = await httpsJson('POST', CA_TOKEN_URL, {
-    'Authorization': `Basic ${auth}`,
-    'Content-Type': 'application/x-www-form-urlencoded',
-    'Accept': 'application/json',
-  }, body);
-  if (r.status !== 200 || !r.body || !r.body.access_token || !r.body.refresh_token) {
-    throw new Error(`troca de code falhou ${r.status}: ${JSON.stringify(r.body).slice(0, 300)}`);
-  }
-  const out = r.body;
-  out.expires_at = Date.now() + ((out.expires_in || 3600) * 1000) - 60000;
-  out.obtained_at = new Date().toISOString();
-  await saveOfficialTokens(out);
-  return out;
-}
-
-async function getOfficialAccessToken() {
-  let tk = await loadOfficialTokens();
-  if (!tk || !tk.access_token || Date.now() >= (tk.expires_at || 0)) tk = await refreshOfficialToken();
-  return tk.access_token;
-}
-
-// Chamada à API oficial v2 (Bearer). Refaz 1x se 401 (token revogado/expirado na borda).
-async function caOfficialRequest(method, apiPath, body, _retried = false) {
-  const token = await getOfficialAccessToken();
-  const r = await httpsJson(method, CA_API_BASE + apiPath, {
-    'Authorization': `Bearer ${token}`,
     'Content-Type': 'application/json',
     'Accept': 'application/json',
   }, body);
-  if (r.status === 401 && !_retried) {
-    await refreshOfficialToken();
-    return caOfficialRequest(method, apiPath, body, true);
-  }
-  return r;
 }
 
 // Enrich por CNPJ (BrasilAPI): optante pelo Simples + endereço estruturado (fallback).
@@ -1726,35 +1645,7 @@ const server = http.createServer(async (req, res) => {
     return send(200, { ok: true, ts: Date.now(), version: SERVICE_VERSION, kill_switch: KILL_SWITCH, gate_keyword: TESTE_KEYWORD || '(disabled — processa todos)', setup_autocreate: SETUP_AUTOCREATE, scan_interval_sec: SCAN_INTERVAL_SEC, official_api: USE_OFFICIAL_API });
   }
 
-  // ── Conectar Conta Azul (OAuth próprio do ca-push) — público (só inicia o login) ──
-  if (req.method === 'GET' && u.pathname === '/conectar') {
-    if (!CA_CLIENT_ID || !CA_REDIRECT_URI) {
-      res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
-      return res.end('<h1>Config faltando</h1><p>Defina CA_CLIENT_ID e CA_REDIRECT_URI no Coolify.</p>');
-    }
-    const state = crypto.randomBytes(8).toString('hex');
-    const qs = `client_id=${encodeURIComponent(CA_CLIENT_ID)}&redirect_uri=${encodeURIComponent(CA_REDIRECT_URI)}&response_type=code&scope=${encodeURIComponent(CA_SCOPE)}&state=${state}`;
-    res.writeHead(302, { Location: `${CA_AUTH_BASE}?${qs}` });
-    return res.end();
-  }
-
-  // ── Callback do OAuth — público (a Conta Azul redireciona pra cá com ?code=) ──
-  if (req.method === 'GET' && u.pathname === '/oauth/callback') {
-    const code = u.searchParams.get('code');
-    const error = u.searchParams.get('error');
-    if (error || !code) {
-      res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
-      return res.end(`<h1>Erro na autorização</h1><pre>${error || 'sem code'}</pre><a href="/conectar">tentar de novo</a>`);
-    }
-    try {
-      const t = await exchangeCodeOfficial(code);
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      return res.end(`<h1>✅ Conta Azul conectada ao ca-push</h1><p>Token guardado no banco (sobrevive a redeploy). Access expira em ${Math.round(t.expires_in || 3600)}s; o serviço renova sozinho.</p>`);
-    } catch (e) {
-      res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
-      return res.end(`<h1>❌ Falha na troca de tokens</h1><pre>${e.message}</pre><a href="/conectar">tentar de novo</a>`);
-    }
-  }
+  // (OAuth do ca-push removido — a API oficial v2 é acessada via helper ca-oauth, ver caOfficialRequest)
 
   if (!checkAuth(req, res)) return;
 
