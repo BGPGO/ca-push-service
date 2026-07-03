@@ -754,7 +754,6 @@ async function createScheduledSale(customerId, contract, opts) {
   const tax = await calcTaxes(valor);
   const nextNum = await nextContractNumber();
 
-  const startDate = String(contract.dataAssinatura).slice(0, 10);
   const dueDay = parseInt(contract.diaVencimento, 10) || 5;
   // FIX data da 1ª parcela: se o comercial definiu a data no contrato (dataPrimeiraParcela),
   // respeita ela (pode ser mais pra frente). Senão, mantém o comportamento antigo.
@@ -767,6 +766,12 @@ async function createScheduledSale(customerId, contract, opts) {
     emissionDate = firstDayNextMonth(contract.dataAssinatura);
     firstDueDate = firstDueAfter(emissionDate, dueDay);
   }
+  // COMPETÊNCIA = dia 01 do mês da 1ª parcela (regra Thomas 03/07/26). A vigência (startDate)
+  // TEM que começar no mesmo mês da emissão: quando a 1ª parcela é adiada (ex.: assina 23/06,
+  // 1ª parcela 10/08 → emissão 01/08), manter startDate=assinatura fazia a CA rejeitar
+  // ("data de emissão da venda inválida"). Alinhar start = emission resolve e ancora a
+  // competência no dia 01 do mês do 1º vencimento.
+  const startDate = emissionDate;
   // endDate: mesmo em FOREVER a CA exige um valor. Coloca 11 meses pra frente do start.
   const endD = new Date(startDate);
   endD.setUTCMonth(endD.getUTCMonth() + 11);
