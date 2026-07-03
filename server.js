@@ -735,7 +735,14 @@ async function applyDiscountToFirstN(schedId, descontoMeses, descontoPercentual,
 }
 
 async function createScheduledSale(customerId, contract, opts) {
-  if (USE_OFFICIAL_API || (opts && opts.useOfficial)) return createScheduledSaleOficial(customerId, contract, opts);
+  // A RECORRÊNCIA vai SEMPRE pela API interna (X-Auth), mesmo com USE_OFFICIAL_API=true.
+  // Motivo (decisão 03/07/26): a v2 (POST /v1/contratos) NÃO expõe os toggles de envio ao
+  // cliente (autoTasks.sendInvoice/issueAndSendBilling/sendReminder) nem a data_emissao usada
+  // p/ alinhar a competência. Só a interna faz os dois. O CLIENTE continua na v2 (endereço
+  // estruturado); o UUID do cliente é compartilhado entre as duas APIs, então a recorrência
+  // interna anexa direto ao cliente criado pela v2. Reverter: RECURRING_VIA_INTERNAL=false.
+  const recurringInternal = String(process.env.RECURRING_VIA_INTERNAL || 'true') === 'true';
+  if (!recurringInternal && (USE_OFFICIAL_API || (opts && opts.useOfficial))) return createScheduledSaleOficial(customerId, contract, opts);
   const productKey = normalizeProductKey(contract.produto);
   const map = PRODUCT_MAP[productKey];
   if (!map) throw new Error(`Produto desconhecido: '${contract.produto}' (normalizado: '${productKey}'). Conhecidos: ${Object.keys(PRODUCT_MAP).join(', ')}`);
