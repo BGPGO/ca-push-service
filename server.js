@@ -332,7 +332,8 @@ async function createScheduledSaleOficial(customerId, contract, opts) {
   if (!valor || valor <= 0) throw new Error(`valorMensal inválido: ${contract.valorMensal}`);
 
   const dueDay = parseInt(contract.diaVencimento, 10) || 5;
-  const startDate = String(contract.dataInicio || contract.dataAssinatura || new Date().toISOString()).slice(0, 10);
+  // Início = ASSINATURA (regra Thomas 27/07/26); dataInicio do CRM é só fallback.
+  const startDate = String(contract.dataAssinatura || contract.dataInicio || new Date().toISOString()).slice(0, 10);
   // FIX #1: data da 1ª parcela = a definida pelo comercial (campo estruturado do CRM).
   // Fallback = primeiro diaVencimento em/após a data de início (NUNCA derivar da assinatura).
   const primeiraParcela = contract.dataPrimeiraParcela
@@ -766,12 +767,20 @@ async function createScheduledSale(customerId, contract, opts) {
     emissionDate = firstDayNextMonth(contract.dataAssinatura);
     firstDueDate = firstDueAfter(emissionDate, dueDay);
   }
-  // COMPETÊNCIA = dia 01 do mês da 1ª parcela (regra Thomas 03/07/26). A vigência (startDate)
-  // TEM que começar no mesmo mês da emissão: quando a 1ª parcela é adiada (ex.: assina 23/06,
-  // 1ª parcela 10/08 → emissão 01/08), manter startDate=assinatura fazia a CA rejeitar
-  // ("data de emissão da venda inválida"). Alinhar start = emission resolve e ancora a
-  // competência no dia 01 do mês do 1º vencimento.
-  const startDate = emissionDate;
+  // VIGÊNCIA (startDate) = data de ASSINATURA (regra Thomas 27/07/26). A COMPETÊNCIA
+  // (emissionDate) NÃO muda: segue no dia 01 do mês da 1ª parcela (regra de 03/07/26).
+  //
+  // GUARDA: a CA rejeita ("data de emissão da venda inválida") quando a emissão não é o
+  // primeiro dia-01 depois do início — com saleEmissionDay=1, ela espera emissão no mês
+  // seguinte ao start. Dois casos quebram: 1ª parcela adiada (S&M assinou 23/06 com 1ª
+  // parcela 10/08 → emissão 01/08, dois meses à frente) e assinatura depois do dia 01 do
+  // mês da 1ª parcela. Nesses, mantém start = emission (comportamento de 03/07) em vez de
+  // deixar a criação FALHAR — contrato sem cobrança é pior que vigência no dia 01.
+  const assinatura = String(contract.dataAssinatura || contract.dataInicio || emissionDate).slice(0, 10);
+  const startDate = firstDayNextMonth(assinatura) === emissionDate ? assinatura : emissionDate;
+  if (startDate !== assinatura) {
+    console.log(`[recorrencia] start=${startDate} (emission) em vez da assinatura ${assinatura}: 1a parcela ${firstDueDate} nao cai no mes seguinte`);
+  }
   // endDate: mesmo em FOREVER a CA exige um valor. Coloca 11 meses pra frente do start.
   const endD = new Date(startDate);
   endD.setUTCMonth(endD.getUTCMonth() + 11);
@@ -1174,7 +1183,12 @@ async function scanAndProcessTest(opts = {}) {
 
   // 1) Busca Contracts SIGNED recentes (ultimas 48h) com relacao Deal+Org+Contact
   const since = new Date(Date.now() - 48 * 3600 * 1000).toISOString();
-  const query = `?select=*,deal:Deal(id,title,closedAt,status,user:User(email),organization:Organization(name,cnpj,phone,email),contact:Contact(name,email,phone))&status=eq.SIGNED&autentiqueSignedAt=gte.${encodeURIComponent(since)}&order=autentiqueSignedAt.desc&limit=100`;
+  // ⚠️ `user:User!Deal_userId_fkey` — o hint de FK é OBRIGATÓRIO: Deal tem DOIS FKs para User
+  // (userId = vendedor, closerId = closer, adicionado no CRM ~22/07/26). Sem o hint o PostgREST
+  // devolve HTTP 300 / PGRST201 ("more than one relationship was found") e o scan morre ANTES
+  // de ler qualquer contrato — foi o que deixou 4 contratos assinados fora da Conta Azul entre
+  // 23 e 27/07/26. O vendedor é o userId (SELLER_MAP usa esse e-mail).
+  const query = `?select=*,deal:Deal(id,title,closedAt,status,user:User!Deal_userId_fkey(email),organization:Organization(name,cnpj,phone,email),contact:Contact(name,email,phone))&status=eq.SIGNED&autentiqueSignedAt=gte.${encodeURIComponent(since)}&order=autentiqueSignedAt.desc&limit=100`;
   const r = await crmRequest('GET', '/Contract' + query);
   if (r.status !== 200) throw new Error(`CRM Contract query falhou ${r.status}: ${JSON.stringify(r.body).slice(0,300)}`);
 
