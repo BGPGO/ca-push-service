@@ -210,6 +210,41 @@ function fmtCnpj(s) {
   return `${c.slice(0,2)}.${c.slice(2,5)}.${c.slice(5,8)}/${c.slice(8,12)}-${c.slice(12)}`;
 }
 
+// ── Simples Nacional ────────────────────────────────────────────────────────────────────
+// ⚠️ LER só pela API INTERNA: a v2 oficial devolve `optante_simples_nacional: false` pra TODOS
+// os clientes (campo não populado na leitura). A interna OMITE o campo quando não é true —
+// ausente = não optante, é assim que a CA calcula o imposto.
+async function getSimplesFlag(customerId) {
+  const r = await caRequest('GET', `/contaazul-bff/person-registration/v1/persons/${customerId}`);
+  if (r.status !== 200 || !r.body) return null;
+  return r.body.isOptingSimple === true;
+}
+
+// Checagem do Simples: compara o cadastro na CA com a Receita (BrasilAPI) e corrige se divergir.
+// ⚠️ ESCREVER só pela v2 (PATCH) — é o único caminho que grava esse campo. Melhor-esforço:
+// nunca lança, no pior caso devolve o que a CA já tinha.
+async function ensureSimplesFlag(customerId, cnpj) {
+  const atual = await getSimplesFlag(customerId);
+  const enrich = await enrichCnpjBrasilApi(cnpj);
+  if (!enrich) {
+    console.log(`[simples] ${cnpj}: Receita indisponível, mantendo cadastro (${atual})`);
+    return { optante: atual === true, checked: false, changed: false };
+  }
+  const alvo = enrich.optante_simples === true;
+  if (atual === alvo) return { optante: alvo, checked: true, changed: false };
+  try {
+    const r = await caOfficialRequest('PATCH', `/v1/pessoas/${customerId}`, {
+      optante_simples_nacional: alvo,
+    });
+    const ok = r.status === 204 || r.status === 200;
+    console.log(`[simples] ${cnpj}: CA=${atual} Receita=${alvo} -> PATCH ${r.status}`);
+    return { optante: ok ? alvo : atual === true, checked: true, changed: ok };
+  } catch (e) {
+    console.log(`[simples] ${cnpj}: falha ao corrigir (${e.message})`);
+    return { optante: atual === true, checked: true, changed: false };
+  }
+}
+
 async function findCustomerByCnpj(cnpj, useOfficial = false) {
   if (USE_OFFICIAL_API || useOfficial) return findCustomerByCnpjOfficial(cnpj);
   const r = await caRequest('GET',
@@ -227,6 +262,9 @@ async function findCustomerByCnpj(cnpj, useOfficial = false) {
 async function createCustomer(c, opts) {
   if (USE_OFFICIAL_API || (opts && opts.useOfficial)) return createCustomerOfficial(c, opts);
   const cnpj = cleanCnpj(c.cnpj);
+  // Simples vem da Receita (BrasilAPI), como já fazia a versão oficial. A CA NÃO preenche
+  // esse campo sozinha — o que a gente mandar é o que fica, e ele decide a retenção de 4,65%.
+  const enrich = await enrichCnpjBrasilApi(cnpj);
   const body = {
     personType: 'Jurídica',
     legalDocument: cnpj,
@@ -234,7 +272,7 @@ async function createCustomer(c, opts) {
     name: (opts?.testMode ? '[TEST] ' : '') + (c.razaoSocial || c.nomeFantasia || 'Cliente'),
     code: fmtCnpj(cnpj),
     isActive: false,
-    isOptingSimple: false,
+    isOptingSimple: enrich ? enrich.optante_simples : false,
     companyName: c.nomeFantasia || '',
     generalRegistry: '',
     birthDate: c.dataAbertura || '2026-01-01',
@@ -416,11 +454,20 @@ async function createSetupSaleOficial(customerId, contract, opts) {
   return { id: r.body.id, legacyId: r.body.id_legado, number: r.body.numero || numero };
 }
 
-async function calcTaxes(value) {
+// O regime do TOMADOR decide PIS+COFINS+CSLL (4,65%): cliente optante do Simples NÃO sofre
+// essa retenção ("não são aplicáveis porque o cliente é Simples Nacional", diz a própria CA).
+// O IRRF (1,5%) não depende disso — a CA só retém quando o imposto dá >= R$ 10 (base >= R$ 666,67).
+// Mandar NORMAL pra optante cobra 4,65% a mais do cliente; mandar SIMPLE_NATIONAL pra não
+// optante deixa de reter. Por isso o flag do cadastro precisa estar certo ANTES daqui.
+async function calcTaxes(value, optanteSimples = false) {
   const r = await caRequest('POST', '/invoice-tax-management/v1/calculate-taxes', {
     key: 1,
     provider: { taxationRegime: 'NORMAL', nationalPattern: true },
-    taker: { type: 'LEGAL_PERSON', taxationRegime: 'NORMAL', publicAgency: false },
+    taker: {
+      type: 'LEGAL_PERSON',
+      taxationRegime: optanteSimples ? 'SIMPLE_NATIONAL' : 'NORMAL',
+      publicAgency: false,
+    },
     service: {
       id: DEFAULTS.serviceIdNfse,
       values: { base: value },
@@ -471,8 +518,8 @@ async function updateScheduledSaleForUpsell(schedId, customerId, productKey, val
   if (!saleId) throw new Error('scheduled-sale sem saleId proxima');
   const itemsR = await caRequest('GET', `/search-engine-core/v1/sales/${saleId}/items?page=1&page_size=10`);
   const oldItems = itemsR.body?.items || [];
-  // Calcula novos taxes
-  const tax = await calcTaxes(valorMensal);
+  // Calcula novos taxes — respeitando o regime do tomador (Simples zera PIS+COFINS+CSLL)
+  const tax = await calcTaxes(valorMensal, (await getSimplesFlag(customerId)) === true);
   // emissionDate = dia 1 do próximo mês (assim novas parcelas usam novo valor)
   const today = new Date();
   const nextMonthFirst = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth() + 1, 1)).toISOString().slice(0, 10);
@@ -671,7 +718,10 @@ async function applyDiscountToFirstN(schedId, descontoMeses, descontoPercentual,
   const targets = linked.slice(0, N);
   if (targets.length === 0) return { applied: [], debug };
 
-  const tax = await calcTaxes(baseCom);
+  // regime do tomador: usa o customerId recebido; se não veio, pega do próprio contrato
+  const cidDesc = customerId
+    || (await caRequest('GET', `/app/v1/scheduled-sales/${schedId}`)).body?.customerId || null;
+  const tax = await calcTaxes(baseCom, cidDesc ? (await getSimplesFlag(cidDesc)) === true : false);
   const results = [];
   for (const t of targets) {
     const sid = t.id;
@@ -752,7 +802,12 @@ async function createScheduledSale(customerId, contract, opts) {
   const valor = Number(contract.valorMensal);
   if (!valor || valor <= 0) throw new Error(`valorMensal invalido: ${contract.valorMensal}`);
 
-  const tax = await calcTaxes(valor);
+  // Regime do tomador: o que decide a retenção de 4,65%. Vem do pipeline (já checado contra a
+  // Receita); se não vier, lê o cadastro na CA — nunca assume NORMAL às cegas.
+  const optanteSimples = (opts && typeof opts.optanteSimples === 'boolean')
+    ? opts.optanteSimples
+    : (await getSimplesFlag(customerId)) === true;
+  const tax = await calcTaxes(valor, optanteSimples);
   const nextNum = await nextContractNumber();
 
   const dueDay = parseInt(contract.diaVencimento, 10) || 5;
@@ -786,6 +841,15 @@ async function createScheduledSale(customerId, contract, opts) {
   endD.setUTCMonth(endD.getUTCMonth() + 11);
   const endDate = endD.toISOString().slice(0, 10);
 
+  // COMPETÊNCIA E VENCIMENTO NO MESMO MÊS. As duas pernas acima já produzem isso (emissão é
+  // sempre dia 01 e firstDueAfter só pula de mês se o dia da emissão passar do dueDay, o que
+  // com emissão no dia 01 nunca acontece). O contrato que nascer desalinhado gera competência
+  // um mês atrás pra sempre — e a CA passa a recusar edição de contrato pela tela. Guarda:
+  if (emissionDate.slice(0, 7) !== firstDueDate.slice(0, 10).slice(0, 7)) {
+    throw new Error(`competência ${emissionDate} e vencimento ${firstDueDate} em meses diferentes — ` +
+      `contrato não seria alinhado (dataPrimeiraParcela='${contract.dataPrimeiraParcela || ''}')`);
+  }
+
   const body = {
     emissionDate,
     customerId,
@@ -810,7 +874,12 @@ async function createScheduledSale(customerId, contract, opts) {
       issueAndSendBilling: true,
       sendReminder: true,
       emailsReceiveInvoice: [contract.emailFinanceiro || contract.emailCliente].filter(Boolean),
-      serviceInvoice: {},
+      // NFS-e automática. Mandar `{}` (como era antes) deixa o contrato nascer sem a emissão
+      // configurada e alguém tem que marcar na mão. Em recorrência o gatilho é a geração da
+      // venda; na venda avulsa de setup a regra é emitir só quando o pagamento for
+      // identificado — o enum desse gatilho ainda não foi confirmado, por isso o setup segue
+      // sem autoTasks (ver createSetupSale).
+      serviceInvoice: { active: true, triggerType: 'SALE_GENERATION', issued: true },
     },
     valueComposition: {
       shipping: 0,
@@ -857,7 +926,10 @@ async function createSetupSale(customerId, contract, opts) {
   if (!map) throw new Error(`Produto desconhecido: '${contract.produto}' (normalizado: '${productKey}')`);
 
   const sellerId = SELLER_MAP[(contract.sellerEmail || '').toLowerCase()] || DEFAULTS.sellerId;
-  const tax = await calcTaxes(valor);
+  const optanteSimples = (opts && typeof opts.optanteSimples === 'boolean')
+    ? opts.optanteSimples
+    : (await getSimplesFlag(customerId)) === true;
+  const tax = await calcTaxes(valor, optanteSimples);
   const committedDate = String(contract.dataAssinatura).slice(0, 10);
 
   // Venda avulsa usa /negotiations/next-number — response shape: {"data": N}
@@ -1255,6 +1327,15 @@ async function scanAndProcessTest(opts = {}) {
         await logAudit(ctx, 'ca_customer', 'create', 'ok', `Criado cliente CA ${out.ca_customer.id}`, out.ca_customer, tCust);
       }
 
+      // 2b) CHECAGEM DO SIMPLES — roda sempre (cliente novo ou reusado), antes de qualquer
+      // cálculo de imposto. Compara o cadastro da CA com a Receita e corrige o que divergir.
+      const tSimples = Date.now();
+      out.ca_simples = await ensureSimplesFlag(out.ca_customer.id, cnpj);
+      await logAudit(ctx, 'ca_simples', out.ca_simples.changed ? 'update' : 'check',
+        out.ca_simples.checked ? 'ok' : 'skipped',
+        `Simples Nacional: ${out.ca_simples.optante ? 'OPTANTE' : 'não optante'}` +
+        (out.ca_simples.changed ? ' — cadastro corrigido' : ''), out.ca_simples, tSimples);
+
       // 3) Scheduled-sale: dedup OR create OR upsell
       const tSched = Date.now();
       const existingSched = await findScheduledSaleByCustomer(out.ca_customer.id, c.razaoSocial || '');
@@ -1315,7 +1396,7 @@ async function scanAndProcessTest(opts = {}) {
           dataInicio: c.dataInicio || null,
           dataPrimeiraParcela: c.dataPrimeiraParcela || null,
           sellerEmail: c.deal?.user?.email,
-        }, { testMode: isTest, useOfficial });
+        }, { testMode: isTest, useOfficial, optanteSimples: out.ca_simples?.optante === true });
         await logAudit(ctx, 'ca_scheduled_sale', 'create', 'ok',
           `Criado scheduled-sale num ${out.ca_scheduledSale.number}`, out.ca_scheduledSale, tSched);
       }
@@ -1384,7 +1465,7 @@ async function scanAndProcessTest(opts = {}) {
               produto: c.produto, valorImplementacao: setupAmount,
               dataAssinatura: c.autentiqueSignedAt || c.dataInicio || new Date().toISOString(),
               sellerEmail: c.deal?.user?.email,
-            }, { testMode: isTest, useOfficial });
+            }, { testMode: isTest, useOfficial, optanteSimples: out.ca_simples?.optante === true });
             await logAudit(ctx, 'ca_setup', 'create', 'ok',
               `Criado setup avulso R$ ${setupAmount} (#${out.ca_setup?.number}) [fonte=${setupSource}]`,
               { ...(out.ca_setup || {}), source: setupSource }, tSetup);
