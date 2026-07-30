@@ -24,6 +24,8 @@ const HELPER_URL = (process.env.HELPER_URL || 'https://ca-oauth.187.77.238.125.s
 const HELPER_ADMIN_TOKEN = process.env.HELPER_ADMIN_TOKEN || '';
 // API de enrich de CNPJ (endereço estruturado fallback + optante pelo Simples). Grátis, sem auth.
 const BRASILAPI_BASE = 'https://brasilapi.com.br/api';
+// A BrasilAPI recusa (429) requisição sem User-Agent. Ver enrichCnpjBrasilApi.
+const BRASILAPI_UA = 'ca-push-service/1.0 (+bgp; contato: thomas@bertuzzipatrimonial.com.br)';
 
 // CRM Supabase (origem dos dados do contrato assinado)
 const CRM_SUPABASE_URL = process.env.CRM_SUPABASE_URL || 'https://gqjgbwzxlqkwvrtorhvb.supabase.co';
@@ -169,13 +171,33 @@ async function caOfficialRequest(method, apiPath, body) {
 }
 
 // Enrich por CNPJ (BrasilAPI): optante pelo Simples + endereço estruturado (fallback).
-// Read-only, melhor-esforço — nunca lança (retorna null em qualquer falha).
+// Read-only. Devolve null se não conseguir falar com a Receita — quem chama decide o que fazer.
+//
+// ⚠️ USER-AGENT É OBRIGATÓRIO. A BrasilAPI responde **429 Too Many Requests** a QUALQUER
+// requisição sem `User-Agent`, independente de volume (o Node não manda um por padrão).
+// Comprovado 30/07/2026, mesmo IP e mesmo segundo: sem UA → 429; com UA → 200. Sem essa
+// linha o enrich devolve null em 100% das chamadas e TODO cliente nasce como não optante,
+// cobrando 4,65% a mais em cada parcela. Foi o que aconteceu com NATHAN ZANCHET.
 async function enrichCnpjBrasilApi(cnpj) {
   const digits = cleanCnpj(cnpj);
   if (digits.length !== 14) return null;
+  const headers = { 'Accept': 'application/json', 'User-Agent': BRASILAPI_UA };
+  let r = null, erro = null;
+  for (let tentativa = 1; tentativa <= 3; tentativa++) {
+    try {
+      r = await httpsJson('GET', `${BRASILAPI_BASE}/cnpj/v1/${digits}`, headers);
+      if (r.status === 200 && r.body && typeof r.body === 'object') break;
+      erro = `HTTP ${r.status}`;
+    } catch (e) { erro = e.message; r = null; }
+    if (tentativa < 3) await new Promise(ok => setTimeout(ok, 800 * tentativa));
+  }
+  if (!r || r.status !== 200 || !r.body || typeof r.body !== 'object') {
+    // Loga o MOTIVO. Antes engolia a exceção e o log só dizia "indisponível", o que escondeu
+    // um 429 determinístico por dois dias.
+    console.error(`[brasilapi] ${digits}: falhou apos 3 tentativas (${erro})`);
+    return null;
+  }
   try {
-    const r = await httpsJson('GET', `${BRASILAPI_BASE}/cnpj/v1/${digits}`, { 'Accept': 'application/json' });
-    if (r.status !== 200 || !r.body || typeof r.body !== 'object') return null;
     const b = r.body;
     return {
       optante_simples: b.opcao_pelo_simples === true,
@@ -227,8 +249,12 @@ async function ensureSimplesFlag(customerId, cnpj) {
   const atual = await getSimplesFlag(customerId);
   const enrich = await enrichCnpjBrasilApi(cnpj);
   if (!enrich) {
-    console.log(`[simples] ${cnpj}: Receita indisponível, mantendo cadastro (${atual})`);
-    return { optante: atual === true, checked: false, changed: false };
+    // ABORTA o push em vez de seguir com um palpite. Sem a Receita não dá pra afirmar o regime,
+    // e o palpite antigo ("mantém o cadastro", que num cliente novo é false) congela 4,65% de
+    // retenção indevida em TODAS as parcelas do contrato — silenciosamente. O contrato não é
+    // marcado como processado, então o scan tenta de novo em 30s (janela de 48h).
+    throw new Error(`Simples Nacional indeterminado para ${cnpj}: Receita (BrasilAPI) ` +
+      `indisponível apos 3 tentativas. Contrato NAO criado — o scan vai retentar.`);
   }
   const alvo = enrich.optante_simples === true;
   if (atual === alvo) return { optante: alvo, checked: true, changed: false };
@@ -264,7 +290,9 @@ async function createCustomer(c, opts) {
   const cnpj = cleanCnpj(c.cnpj);
   // Simples vem da Receita (BrasilAPI), como já fazia a versão oficial. A CA NÃO preenche
   // esse campo sozinha — o que a gente mandar é o que fica, e ele decide a retenção de 4,65%.
+  // Sem a Receita não cria: nascer com o regime errado sai mais caro que nascer 30s depois.
   const enrich = await enrichCnpjBrasilApi(cnpj);
+  if (!enrich) throw new Error(`Simples Nacional indeterminado para ${cnpj}: Receita (BrasilAPI) indisponível — cliente NAO criado`);
   const body = {
     personType: 'Jurídica',
     legalDocument: cnpj,
@@ -322,8 +350,10 @@ async function createCustomerOfficial(c, opts) {
   const emailFin = String(c.emailFinanceiro || '').trim();
   if (!emailFin) throw new Error('emailFinanceiro ausente — obrigatório p/ cobrança (Conta Azul)');
 
-  // Enrich CNPJ (BrasilAPI): optante Simples + endereço fallback.
+  // Enrich CNPJ (BrasilAPI): optante Simples + endereço fallback. Sem ele o cadastro nasceria
+  // com o regime chutado (false) — que é o que deixou NATHAN ZANCHET fora do Simples em 30/07.
   const enrich = await enrichCnpjBrasilApi(cnpj);
+  if (!enrich) throw new Error(`Simples Nacional indeterminado para ${cnpj}: Receita (BrasilAPI) indisponível — cliente NAO criado`);
   const ee = (enrich && enrich.endereco) || {};
 
   // Endereço: prioriza o ESTRUTURADO vindo do CRM; fallback BrasilAPI.
@@ -874,12 +904,20 @@ async function createScheduledSale(customerId, contract, opts) {
       issueAndSendBilling: true,
       sendReminder: true,
       emailsReceiveInvoice: [contract.emailFinanceiro || contract.emailCliente].filter(Boolean),
-      // NFS-e automática. Mandar `{}` (como era antes) deixa o contrato nascer sem a emissão
-      // configurada e alguém tem que marcar na mão. Em recorrência o gatilho é a geração da
-      // venda; na venda avulsa de setup a regra é emitir só quando o pagamento for
-      // identificado — o enum desse gatilho ainda não foi confirmado, por isso o setup segue
-      // sem autoTasks (ver createSetupSale).
-      serviceInvoice: { active: true, triggerType: 'SALE_GENERATION', issued: true },
+      // NFS-e automática. MEDIDO em 30/07/2026 com contratos descartáveis (criar → ler na hora
+      // → apagar), porque o estado dos contratos reais é editado na mão e não serve de prova:
+      //   payload enviado                                    → o que a CA grava
+      //   (chave ausente)                                    → active=false, SALE_GENERATION
+      //   {}                                                 → active=false, SALE_GENERATION
+      //   {active:true}                                      → active=true,  SALE_GENERATION
+      //   {active:true, triggerType:'SALE_GENERATION'}       → active=true,  SALE_GENERATION
+      //   {active:true, triggerType:'PAYMENT_IDENTIFICATION'}→ active=true,  PAYMENT_IDENTIFICATION
+      // Ou seja: `{}` nasce com a emissão DESLIGADA (era o que obrigava a marcar na mão) e o
+      // triggerType é respeitado. `issued` é SÓ LEITURA (status "já emitida") — sempre volta
+      // false na criação, então não adianta mandar. Em recorrência o gatilho certo é a geração
+      // da venda. NÃO dá pra consertar depois: PUT devolve 400 (saleItems) ou 500 — contrato
+      // que nasceu errado só se conserta pela tela.
+      serviceInvoice: { active: true, triggerType: 'SALE_GENERATION' },
     },
     valueComposition: {
       shipping: 0,
