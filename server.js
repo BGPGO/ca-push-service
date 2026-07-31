@@ -1012,9 +1012,17 @@ async function createScheduledSale(customerId, contract, opts) {
 //   2) a NOTIFICAÇÃO é quem confirma a cobrança e faz nascer a `url` da fatura.
 // Só a primeira não adianta: fica pendente e o cliente nunca recebe nada.
 async function gerarCobrancaVenda(saleId, tipoCobranca, emails, opts = {}) {
-  const r1 = await caRequest('GET', `/contaazul-bff/sale/v1/sales/${saleId}`);
-  const eventoId = (r1.body?.financialEvents || [])[0]?.id;
-  if (!eventoId) throw new Error(`venda ${saleId} sem evento financeiro — nada a cobrar`);
+  // ⚠️ LAG DE CONSISTÊNCIA: o evento financeiro (o recebível) NÃO nasce junto com a venda —
+  // aparece alguns segundos depois. Ler na hora devolve `financialEvents: []` e a cobrança se
+  // perde. Aconteceu com a venda 4560 (Finasu, 31/07). Mesmo lag já documentado na criação de
+  // cliente → contrato. Por isso: tenta até 6 vezes, ~15s no total.
+  let eventoId = null;
+  for (let t = 1; t <= 6 && !eventoId; t++) {
+    const r = await caRequest('GET', `/contaazul-bff/sale/v1/sales/${saleId}`);
+    eventoId = (r.body?.financialEvents || [])[0]?.id || null;
+    if (!eventoId && t < 6) await new Promise(ok => setTimeout(ok, 1000 * t));
+  }
+  if (!eventoId) throw new Error(`venda ${saleId} sem evento financeiro apos 6 tentativas — cobrar pela tela`);
 
   const r2 = await caRequest('GET', `/finance-pro/v1/financial-events/${eventoId}`);
   const parcelas = (r2.body?.paymentCondition?.installments) || [];
@@ -2158,11 +2166,20 @@ ${runs.length === 0 ? '<p class="muted">Nenhum evento. Tabela bgp_pipeline_audit
       out.customer = { id: customerId, cnpj };
 
       const termo = input.razaoSocial || cust.name || '';
+      // Se a venda já existe, não recria — mas TENTA a cobrança, porque o caso comum é a venda
+      // ter nascido e a cobrança ter falhado (lag da CA). O gerarCobrancaVenda devolve
+      // `skipped: ja_cobrada` se a parcela já tiver cobrança, então re-chamar é seguro.
       const existente = await findSetupSaleByCustomer(customerId, valor, termo);
       if (existente) {
-        out.ok = true;
         out.setupSale = { id: existente.id, number: existente.number, reused: true };
-        out.note = 'venda avulsa desse valor já existe — nada criado';
+        out.note = 'venda avulsa desse valor já existe — não recriada';
+        try {
+          out.cobranca = await gerarCobrancaVenda(existente.id,
+            formaPagamento({ formaPagamento: input.formaPagamento }).cobranca,
+            [input.emailFinanceiro].filter(Boolean),
+            { numero: existente.number, cliente: termo });
+        } catch (e) { out.cobranca_error = e.message; }
+        out.ok = true;
         return send(200, out);
       }
       const contrato = {
