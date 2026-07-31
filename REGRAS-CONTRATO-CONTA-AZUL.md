@@ -121,7 +121,21 @@ Validado contra `publica.cnpj.ws` em 4 casos (3 nulos + 1 controle): bate 100%.
 
 `ensureSimplesFlag(customerId, cnpj)` roda **em todo push**, para cliente novo **e reusado**:
 lê o flag na interna, compara com a Receita, corrige pela v2 se divergir. Registra no audit
-log como `ca_simples`. É melhor-esforço: se a Receita não responder, mantém o cadastro.
+log como `ca_simples`. Se a Receita não responder, **aborta o push** — o contrato não é marcado
+como processado e o scan retenta em 30s. Chutar o regime custa 4,65% em toda parcela.
+
+### ⚠️ A BrasilAPI EXIGE `User-Agent` — sem ele, 429 sempre
+
+A BrasilAPI responde **429 Too Many Requests** a qualquer requisição sem cabeçalho
+`User-Agent`, **independente de volume**. O Node não manda um por padrão. Comprovado em
+30/07/2026, mesmo IP e mesmo segundo: sem UA → 429; com `curl/8.5.0`, `Mozilla/5.0` ou
+`ca-push-service/1.0` → 200. Com UA de biblioteca (`Python-urllib/3.12`, `node`) → 403.
+
+Enquanto isso passou batido, `enrichCnpjBrasilApi` devolveu `null` em **100%** das chamadas
+e **todo cliente criado pelo pipeline nasceu como não optante** — foi a origem das 20
+divergências corrigidas na mão em 28/07 e do caso NATHAN ZANCHET (30/07, R$ 116,11/mês).
+O `catch` mudo escondeu o 429 por dois dias: o log só dizia "Receita indisponível". Corrigido
+em `6801421` (UA + 3 tentativas + log do motivo).
 
 ---
 
@@ -176,14 +190,33 @@ mande explicitamente), `paymentCondition` do GET, `saleItems` de
 | "Gerar e enviar a **cobrança** automaticamente" | `issueAndSendBilling` |
 | "Emitir e enviar a **NFS-e** automaticamente" | `serviceInvoice.active` |
 | "Assim que a venda for gerada" | `serviceInvoice.triggerType: "SALE_GENERATION"` |
-| "Apenas quando identificarmos o pagamento" | `triggerType` — **enum não confirmado** |
+| "Apenas quando identificarmos o pagamento" | `serviceInvoice.triggerType: "PAYMENT_IDENTIFICATION"` |
 | E-mails | `emailsReceiveInvoice[]` |
 | Lembretes | `sendReminder` |
 
 Regra da casa: **recorrência** emite na geração da venda; **venda avulsa (setup)** só quando o
-pagamento for identificado. O enum do segundo caso ainda não foi descoberto — o endpoint
-`/app/v2/scheduled-sales/{id}/auto-tasks` é só leitura e não existe venda avulsa na conta para
-copiar. **Não chutar:** errar aqui emite nota fiscal na hora errada. Resolve com um HAR da tela.
+pagamento for identificado.
+
+### O que a CA grava, de verdade (medido 30/07/2026)
+
+⚠️ **Não audite esse campo lendo os contratos reais** — a financeira edita os flags na mão, e o
+estado de hoje não prova nada sobre como o contrato nasceu. O jeito certo é criar contrato
+descartável → ler na hora → apagar (`DELETE /app/v1/scheduled-sales/{id}` funciona).
+
+| Payload enviado no POST | `active` gravado | `triggerType` gravado |
+|---|---|---|
+| chave `serviceInvoice` ausente | **false** | SALE_GENERATION |
+| `{}` | **false** | SALE_GENERATION |
+| `{active:true}` | true | SALE_GENERATION (default) |
+| `{active:true, triggerType:'SALE_GENERATION'}` | true | SALE_GENERATION |
+| `{active:true, triggerType:'PAYMENT_IDENTIFICATION'}` | true | PAYMENT_IDENTIFICATION |
+
+- `{}` faz o contrato **nascer com a emissão desligada** — era o que obrigava a marcar na mão.
+- `triggerType` **é respeitado**; os dois enums funcionam.
+- `issued` é **só leitura** (status "já emitida"): sempre volta `false` na criação. Não mandar.
+- `sendReminder` volta `false` mesmo mandando `true` — é configuração de conta, não nossa.
+- **Não dá pra consertar depois pela API**: PUT devolve 400 (`saleItems` não vem no GET) e, mesmo
+  com `saleItems` explícitos, 500. Contrato que nasceu errado só se conserta pela tela.
 
 ### O que trava a automação de NFS-e
 
