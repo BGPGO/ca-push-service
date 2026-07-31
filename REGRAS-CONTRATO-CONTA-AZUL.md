@@ -218,6 +218,31 @@ descartável → ler na hora → apagar (`DELETE /app/v1/scheduled-sales/{id}` f
 - **Não dá pra consertar depois pela API**: PUT devolve 400 (`saleItems` não vem no GET) e, mesmo
   com `saleItems` explícitos, 500. Contrato que nasceu errado só se conserta pela tela.
 
+### ⚠️ Na VENDA AVULSA o campo é OUTRO
+
+Contrato recorrente e venda avulsa **não usam o mesmo campo**. Copiar o do contrato para a avulsa
+não funciona — a chave é ignorada e a venda nasce com a emissão desligada.
+
+| | Contrato recorrente | Venda avulsa |
+|---|---|---|
+| POST | `/app/v1/scheduled-sales/` | `/app/v1/sales/` |
+| Campo | `autoTasks.serviceInvoice` | `automation.serviceInvoiceEmission` |
+| Chaves | `{active, triggerType}` | `{active, type}` |
+| GET que funciona | `/app/v1/scheduled-sales/{id}` | `/contaazul-bff/sale/v1/sales/{id}` — o `/app/v1/sales/{id}` responde **500** |
+
+```jsonc
+// venda avulsa: emitir a NFS-e quando o pagamento for identificado (regra da casa)
+"automation": { "serviceInvoiceEmission": { "type": "PAYMENT_IDENTIFICATION", "active": true } }
+```
+
+Comprovado em 31/07/2026 criando a venda **4559** (Pôr do Sol, R$ 997): o POST aceita o campo e a
+releitura confirma `active: true`. Antes disso, **todas** as avulsas da base tinham `active: false`
+— o `createSetupSale` não manda nada — e a nota era emitida na mão, quando alguém lembrava.
+
+⚠️ **Venda avulsa a CA NÃO deixa apagar pela API.** Tem que sair certa de primeira: confira o
+payload antes do POST e releia depois. E ponha uma guarda contra duplicata (`findSetupSaleByCustomer`
+compara o valor **bruto** do item, não o líquido).
+
 ### O que trava a automação de NFS-e
 
 A CA exige, no cadastro do cliente: **razão social, CNPJ, endereço, telefone e e-mail**. Em
