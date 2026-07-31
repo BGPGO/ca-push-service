@@ -232,6 +232,36 @@ function fmtCnpj(s) {
   return `${c.slice(0,2)}.${c.slice(2,5)}.${c.slice(5,8)}/${c.slice(8,12)}-${c.slice(12)}`;
 }
 
+// Valida CNPJ pelos dígitos verificadores. O CRM é campo livre: já entrou CNPJ vazio, com
+// dígito trocado e com máscara pela metade. CNPJ errado não falha na hora — cria cliente
+// duplicado ou joga a cobrança no cliente errado, e alguém descobre meses depois.
+function validaCnpj(s) {
+  const c = cleanCnpj(s);
+  if (c.length !== 14 || /^(\d)\1{13}$/.test(c)) return false;
+  const dv = (base) => {
+    let peso = base.length - 7, soma = 0;
+    for (let i = 0; i < base.length; i++) {
+      soma += Number(base[i]) * peso--;
+      if (peso < 2) peso = 9;
+    }
+    const r = soma % 11;
+    return String(r < 2 ? 0 : 11 - r);
+  };
+  const d1 = dv(c.slice(0, 12));
+  return d1 === c[12] && dv(c.slice(0, 12) + d1) === c[13];
+}
+
+// Data de vencimento do SETUP = D+1 da assinatura (regra Thomas 31/07/2026). O setup é o
+// fechamento do contrato: o prazo é curto de propósito. ⚠️ NUNCA usar a própria data da
+// assinatura — a venda nasce vencida no mesmo dia, e foi isso que produziu a parcela fantasma
+// do BRONZE DA GG (renegociada, com a original travada em "Atrasado" e a NFS-e presa).
+function vencimentoSetup(dataAssinatura) {
+  const base = String(dataAssinatura || new Date().toISOString()).slice(0, 10);
+  const d = new Date(base + 'T12:00:00Z');
+  d.setUTCDate(d.getUTCDate() + 1);
+  return d.toISOString().slice(0, 10);
+}
+
 // ── Simples Nacional ────────────────────────────────────────────────────────────────────
 // ⚠️ LER só pela API INTERNA: a v2 oficial devolve `optante_simples_nacional: false` pra TODOS
 // os clientes (campo não populado na leitura). A interna OMITE o campo quando não é true —
@@ -472,7 +502,7 @@ async function createSetupSaleOficial(customerId, contract, opts) {
       tipo_pagamento: 'BOLETO_BANCARIO',
       id_conta_financeira: DEFAULTS.financialAccountId,
       opcao_condicao_pagamento: 'À vista',
-      parcelas: [{ data_vencimento: committedDate, valor }],
+      parcelas: [{ data_vencimento: vencimentoSetup(contract.dataAssinatura), valor }],
     },
     observacoes: opts && opts.testMode ? 'TEST E2E CRM Setup — apagar' : `Setup ${contract.produto}`,
   };
@@ -999,7 +1029,7 @@ async function createSetupSale(customerId, contract, opts) {
       paymentType: 'BANKING_BILLET',
       financialAccountId: DEFAULTS.financialAccountId,
       paymentConditionOption: 'À vista',
-      installments: [{ dueDate: committedDate, value: tax.values.total }],
+      installments: [{ dueDate: vencimentoSetup(contract.dataAssinatura), value: tax.values.total }],
     },
     observations: opts?.testMode ? 'TEST E2E CRM Setup — apagar' : `Setup ${contract.produto}`,
     invoiceObservations: '',
@@ -1328,8 +1358,20 @@ async function scanAndProcessTest(opts = {}) {
     try {
       const org = c.deal?.organization || {};
       const contact = c.deal?.contact || {};
+      // CNPJ vem do CONTRATO (o que foi preenchido pra emitir o documento assinado). A
+      // organização do deal é só fallback — 7.506 das 7.543 orgs do CRM têm o campo vazio.
       const cnpj = (c.cnpj || org.cnpj || '').replace(/\D/g, '');
       ctx.cnpj = cnpj;
+      // TRAVA (regra Thomas 31/07/2026): CNPJ ausente ou inválido não prossegue. Antes seguia
+      // e a CA criava/buscava cliente com documento quebrado — o erro só aparecia no faturamento.
+      if (!validaCnpj(cnpj)) {
+        const motivo = !cnpj ? 'CNPJ não preenchido no contrato do CRM'
+          : `CNPJ inválido no contrato do CRM: '${c.cnpj || org.cnpj}'`;
+        await logAudit(ctx, 'validacao', 'cnpj', 'error',
+          `${motivo} — contrato NÃO enviado pra Conta Azul. Corrigir no CRM que o scan reprocessa.`,
+          { crm_contract_id: c.id, cnpj_contrato: c.cnpj, cnpj_org: org.cnpj }, t0);
+        throw new Error(`${motivo}. Corrija no CRM — nada foi criado na Conta Azul.`);
+      }
       // 🐤 CANARY por nome: deal/lead começando com "teste" → roteia pra API OFICIAL v2
       // (testa a v2 em produção real sem ligar o flag global). Os demais seguem no interno (X-Auth).
       const isTest = [c.razaoSocial, c.deal?.title, c.deal?.organization?.name, c.nomeFantasia]
@@ -1564,16 +1606,44 @@ async function scanAndProcessTest(opts = {}) {
   let aditivos = [];
   try {
     const sinceAdit = new Date(Date.now() - 48 * 3600 * 1000).toISOString();
-    const aq = `?select=id,documentName,documentType,documentId,status,dealId,updatedAt,deal:Deal(id,title,status,organization:Organization(name,cnpj))&documentType=eq.aditivo&status=eq.signed&updatedAt=gte.${encodeURIComponent(sinceAdit)}&order=updatedAt.desc&limit=50`;
+    // ⚠️ `autentiqueDocumentId`, NÃO `documentId`: essa coluna NUNCA existiu em SentDocument.
+    // O PostgREST respondia 400 (`column SentDocument.documentId does not exist`) e, como o
+    // crmRequest NÃO lança em erro (devolve {status:400}), o `if` abaixo era falso e o bloco
+    // inteiro era pulado — sem UMA linha de log. Resultado: a automação de aditivo nunca
+    // processou nada entre 28/05 e 31/07/2026. Ver o upsell de R$997 do Pôr do Sol.
+    const aq = `?select=id,documentName,documentType,autentiqueDocumentId,status,dealId,updatedAt,deal:Deal(id,title,status,contracts:Contract(id,cnpj,razaoSocial,status,autentiqueSignedAt),organization:Organization(name,cnpj))&documentType=eq.aditivo&status=eq.signed&updatedAt=gte.${encodeURIComponent(sinceAdit)}&order=updatedAt.desc&limit=50`;
     const ar = await crmRequest('GET', '/SentDocument' + aq);
+    if (ar.status !== 200 || !Array.isArray(ar.body)) {
+      // Falha de query NÃO pode mais passar em silêncio — foi assim que ficamos 2 meses cegos.
+      console.error(`[aditivo-scan] consulta do CRM falhou ${ar.status}: ${JSON.stringify(ar.body).slice(0, 300)}`);
+    }
     if (ar.status === 200 && Array.isArray(ar.body)) {
       for (const a of ar.body) {
-        const cnpjAdit = (a.deal?.organization?.cnpj || '').replace(/\D/g, '');
-        const ctxA = { run_id: uuid(), cnpj: cnpjAdit || null, client_name: a.deal?.organization?.name || a.deal?.title || a.documentName, crm_contract_id: null };
-        const aOut = { sent_document_id: a.id, document_id: a.documentId, document: a.documentName, deal: a.deal?.title, dealId: a.dealId, cnpj: cnpjAdit };
+        // CNPJ do aditivo vem do CONTRATO do deal — o mesmo que foi usado pra emitir o
+        // documento assinado. `deal.organization.cnpj` é fallback e quase sempre está vazio.
+        // Prefere o contrato ASSINADO; senão, o primeiro com CNPJ válido.
+        const contratos = a.deal?.contracts || [];
+        const doContrato = contratos.find(x => x.status === 'SIGNED' && validaCnpj(x.cnpj))
+          || contratos.find(x => validaCnpj(x.cnpj));
+        const cnpjAdit = cleanCnpj(doContrato?.cnpj || a.deal?.organization?.cnpj || '');
+        const ctxA = { run_id: uuid(), cnpj: cnpjAdit || null, client_name: doContrato?.razaoSocial || a.deal?.organization?.name || a.deal?.title || a.documentName, crm_contract_id: doContrato?.id || null };
+        const aOut = { sent_document_id: a.id, document_id: a.autentiqueDocumentId, document: a.documentName, deal: a.deal?.title, dealId: a.dealId, cnpj: cnpjAdit, crm_contract_id: doContrato?.id || null };
         try {
+          // TRAVA (regra Thomas 31/07/2026): sem CNPJ válido NO CONTRATO, não prossegue. Não
+          // marca como aplicado — assim que corrigirem no CRM, o scan reprocessa sozinho
+          // (dentro da janela de 48h).
+          if (!validaCnpj(cnpjAdit)) {
+            const bruto = doContrato?.cnpj || a.deal?.organization?.cnpj || '';
+            aOut.error = `cnpj_invalido_no_contrato cnpj='${bruto}'`;
+            await logAudit(ctxA, 'aditivo', 'cnpj', 'error',
+              `Aditivo '${a.documentName}': ${contratos.length ? `contrato do deal com CNPJ ${bruto ? `inválido ('${bruto}')` : 'vazio'}` : 'deal sem contrato no CRM'}` +
+              ` — NÃO enviado pra Conta Azul. Corrigir no CRM que o scan reprocessa.`,
+              { sent_document_id: a.id, dealId: a.dealId, contratos: contratos.map(x => ({ id: x.id, cnpj: x.cnpj, status: x.status })) }, null);
+            aditivos.push(aOut);
+            continue;
+          }
           // Idempotência durável (a coluna foi adicionada em 2026-05-28).
-          if (await finhubAditivoApplied(a.documentId)) {
+          if (await finhubAditivoApplied(a.autentiqueDocumentId)) {
             aOut.skipped = 'already_applied';
             aditivos.push(aOut);
             continue;
@@ -1724,7 +1794,7 @@ async function scanAndProcessTest(opts = {}) {
 
           // Marca idempotência durável (mesmo com erro parcial — não tenta de novo automático)
           aOut.ok = !aOut.ca_setup_error && !aOut.ca_mrr_error;
-          await markAditivoApplied(a.documentId, aOut);
+          await markAditivoApplied(a.autentiqueDocumentId, aOut);
         } catch (e) {
           aOut.ok = false;
           aOut.error = e.message;

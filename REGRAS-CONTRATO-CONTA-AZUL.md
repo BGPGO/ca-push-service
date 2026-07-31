@@ -36,6 +36,15 @@ intercambiáveis** — cada campo tem um lado que funciona. Ver §4 e §9.
 | **Competência (emissão)** | = **dia 01** do mês da 1ª parcela | `emissionDate` |
 | **Competência e vencimento** | **no mesmo mês, sempre** | guarda que aborta a criação se divergir |
 | **Cadência** | mensal, `saleEmissionDay: 1`, `expirationType: FOREVER` | `terms` |
+| **Vencimento do SETUP (venda avulsa)** | = **D+1 da assinatura** | `vencimentoSetup()` |
+
+**Por que D+1 no setup:** o setup é o fechamento do contrato — o prazo é curto de propósito
+(regra Thomas, 31/07/2026). ⚠️ **Nunca usar a própria data da assinatura**, como o código fazia
+até 31/07: a venda nasce vencida no mesmo dia. Foi assim que a venda 4547 do BRONZE DA GG virou
+parcela fantasma — renegociada, com a original travada em "Atrasado" e a NFS-e presa num RPS que
+nunca pôde ser transmitido. Num setup assinado no último dia do mês, o D+1 cai no mês seguinte;
+isso é esperado e não conflita com nada (a regra de competência × vencimento vale para o contrato
+recorrente, não para a avulsa).
 
 **Exceção documentada:** quando a 1ª parcela é adiada para além do mês seguinte à assinatura
 (assinou 23/06, 1ª parcela 10/08), a CA recusa a criação se o início não casar com a cadência.
@@ -319,11 +328,40 @@ ele o contrato assinado simplesmente não aparece na CA.
 
 ---
 
-## 11. Pendências abertas
+## 11. CNPJ: de onde vem e quando trava
 
-1. **Enum do gatilho de NFS-e da venda avulsa** — precisa de um HAR da tela. (§7)
+**O CNPJ sempre vem do CONTRATO do CRM** — o mesmo que foi usado para emitir o documento
+assinado. Vale para contrato novo (`Contract.cnpj`) e para aditivo (o `Contract` do deal, via
+embed `deal:Deal(contracts:Contract(...))`; prefere o `SIGNED`, senão o primeiro com CNPJ válido).
+`deal.organization.cnpj` é só fallback e é inútil na prática: **37 de 7.543 organizações** do CRM
+têm o campo preenchido.
+
+**Sem CNPJ válido, o push TRAVA** (regra Thomas, 31/07/2026) — nada é criado na Conta Azul, nem
+cliente nem venda. Validação por dígito verificador (`validaCnpj`), não só contagem de dígitos.
+O contrato não é marcado como processado, então basta corrigir no CRM que o scan reprocessa
+sozinho dentro da janela de 48h. O erro fica no log e no audit como `validacao/cnpj` (contrato)
+ou `aditivo/cnpj` (aditivo).
+
+Antes disso o pipeline seguia com CNPJ vazio ou quebrado e a CA criava cliente duplicado ou
+pendurava a cobrança no lugar errado — o estrago só aparecia no faturamento, meses depois.
+
+⚠️ **Isso vai barrar muita coisa no começo:** em 31/07/2026, de 22 aditivos assinados nos últimos
+90 dias, **só 5 passariam**. Os outros 17 têm contrato com CNPJ vazio ou nem têm contrato no deal.
+Isso é o sintoma aparecendo, não um bug novo.
+
+---
+
+## 12. Pendências abertas
+
+1. **Gerar a cobrança (link) da venda avulsa** — o fluxo está mapeado no HAR de 31/07: `POST
+   /finance-pro/v2/charge-requests/batch-create` (id + `version` da parcela) e depois `POST
+   /finance-pro/v1/charge-notifications`, que é quem confirma a cobrança e gera a `url`. Falta
+   decidir **boleto ou link** no setup — o tipo do charge-request tem que casar com o
+   `paymentType` da venda, e só o `RECEBA_FACIL_PAYMENT_LINK` está comprovado. (§7)
 2. **85 parcelas sem bloco fiscal** — decidir se cria o bloco. (§10)
 3. **Deal sem contato vinculado** no CRM — impede o telefone de chegar e trava a NFS-e. (§7)
 4. **Endereço estruturado em 14% dos contratos** — derivar do texto livre no push. (§7)
 5. **4 contratos com competência desalinhada da cadência** (512, 544, 546, 547, 548) — a edição
    pela tela segue recusada neles. (§2)
+6. **`bgp_pipeline_audit` não existe no FinHub** — o `audit-table.sql` está no repo e nunca foi
+   rodado. Sem ela, `/admin/log` é cego e toda investigação vira leitura de log de container.
