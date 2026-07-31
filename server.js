@@ -251,6 +251,20 @@ function validaCnpj(s) {
   return d1 === c[12] && dv(c.slice(0, 12) + d1) === c[13];
 }
 
+// Forma de pagamento vem do CONTRATO do CRM (`Contract.formaPagamento`: 'boleto' | 'cartao').
+// Cada linha aqui tem 3 nomes diferentes pro mesmo conceito, um por API — não inventar:
+//   CRM        venda (interna)   venda (v2 oficial)   charge-request (cobrança)
+//   boleto  →  BANKING_BILLET    BOLETO_BANCARIO      RECEBA_FACIL_BANK_SLIP
+//   cartao  →  PAYMENT_LINK      LINK_PAGAMENTO       RECEBA_FACIL_PAYMENT_LINK
+// Enums da venda v2 conferidos no OpenAPI oficial (_bundle/docs/sales-apis-openapi.yaml);
+// os da cobrança, lidos de cobranças reais da base (ECOBPO 4551 = boleto, Pôr do Sol 4559 = link).
+function formaPagamento(contract) {
+  const cartao = String(contract && contract.formaPagamento || '').toLowerCase().includes('cart');
+  return cartao
+    ? { interna: 'PAYMENT_LINK', oficial: 'LINK_PAGAMENTO', cobranca: 'RECEBA_FACIL_PAYMENT_LINK' }
+    : { interna: 'BANKING_BILLET', oficial: 'BOLETO_BANCARIO', cobranca: 'RECEBA_FACIL_BANK_SLIP' };
+}
+
 // Data de vencimento do SETUP = D+1 da assinatura (regra Thomas 31/07/2026). O setup é o
 // fechamento do contrato: o prazo é curto de propósito. ⚠️ NUNCA usar a própria data da
 // assinatura — a venda nasce vencida no mesmo dia, e foi isso que produziu a parcela fantasma
@@ -499,7 +513,7 @@ async function createSetupSaleOficial(customerId, contract, opts) {
     id_vendedor: sellerId,
     itens: [{ id: DEFAULTS.serviceIdNfse, quantidade: 1, valor, descricao: 'Setup / implementacao' }],
     condicao_pagamento: {
-      tipo_pagamento: 'BOLETO_BANCARIO',
+      tipo_pagamento: formaPagamento(contract).oficial,
       id_conta_financeira: DEFAULTS.financialAccountId,
       opcao_condicao_pagamento: 'À vista',
       parcelas: [{ data_vencimento: vencimentoSetup(contract.dataAssinatura), valor }],
@@ -984,6 +998,72 @@ async function createScheduledSale(customerId, contract, opts) {
   return { id: r.body.id, legacyId: r.body.legacyId, number: nextNum, emissionDate, firstDueDate };
 }
 
+// ---------- COBRANÇA (boleto / link de pagamento) ----------
+// `POST /app/v1/sales/` cria a venda e o recebível, mas NÃO emite a cobrança: o boleto/link é um
+// objeto separado (`chargeRequest`). No contrato recorrente quem dispara é o autoTasks
+// `issueAndSendBilling`; venda avulsa não tem autoTasks, então até 31/07/2026 TODA avulsa criada
+// pelo pipeline ficou sem cobrança, esperando alguém lembrar (Imob Show 4414, Pôr do Sol 4559...).
+//
+// São DUAS chamadas — mapeadas no HAR da tela em 31/07/2026:
+//   1) batch-create devolve a cobrança em AWAITING_CONFIRMATION, com `url: null`;
+//   2) a NOTIFICAÇÃO é quem confirma a cobrança e faz nascer a `url` da fatura.
+// Só a primeira não adianta: fica pendente e o cliente nunca recebe nada.
+async function gerarCobrancaVenda(saleId, tipoCobranca, emails, opts = {}) {
+  const r1 = await caRequest('GET', `/contaazul-bff/sale/v1/sales/${saleId}`);
+  const eventoId = (r1.body?.financialEvents || [])[0]?.id;
+  if (!eventoId) throw new Error(`venda ${saleId} sem evento financeiro — nada a cobrar`);
+
+  const r2 = await caRequest('GET', `/finance-pro/v1/financial-events/${eventoId}`);
+  const parcelas = (r2.body?.paymentCondition?.installments) || [];
+  if (!parcelas.length) throw new Error(`evento ${eventoId} sem parcelas`);
+  const jaCobrada = parcelas.some(p => (p.chargeRequests || []).length > 0);
+  if (jaCobrada) return { skipped: 'ja_cobrada' };
+
+  const grupos = parcelas.map((p, i) => ({
+    originalDescription: p.description || `Venda ${opts.numero || ''}`.trim(),
+    description: `${p.description || `Venda ${opts.numero || ''}`.trim()} - ${i + 1}/${parcelas.length}`,
+    installmentIds: [{ id: p.id, version: p.version || 0 }],
+    dueDate: String(p.dueDate).slice(0, 10),
+    value: p.valueComposition?.netValue ?? p.unpaid,
+    index: i + 1,
+  }));
+  const body = {
+    financialAccountId: DEFAULTS.financialAccountId,
+    installmentGroups: grupos,
+    type: tipoCobranca,
+    // customAttributes só no link (o boleto real da base vem com esse campo nulo).
+    ...(tipoCobranca === 'RECEBA_FACIL_PAYMENT_LINK'
+      ? { customAttributes: { creditCard: { maxInstallments: '10' }, charge: { type: 'INVOICE' } } }
+      : {}),
+  };
+  const r3 = await caRequest('POST', '/finance-pro/v2/charge-requests/batch-create', body);
+  const criadas = (r3.body?.items) || [];
+  if (r3.status !== 200 || !criadas.length) {
+    throw new Error(`batch-create falhou ${r3.status}: ${JSON.stringify(r3.body).slice(0, 400)}`);
+  }
+  const ids = criadas.map(c => c.id);
+
+  const destinos = (emails || []).filter(Boolean);
+  if (!destinos.length) return { chargeRequestIds: ids, notificado: false, motivo: 'sem e-mail' };
+  const total = grupos.reduce((a, g) => a + Number(g.value || 0), 0);
+  const linhas = grupos.map(g => `- R$ ${Number(g.value).toFixed(2).replace('.', ',')} com vencimento em ` +
+    `${g.dueDate.slice(8, 10)}/${g.dueDate.slice(5, 7)}/${g.dueDate.slice(0, 4)}, referente a: ${g.description}`);
+  const r4 = await caRequest('POST', '/finance-pro/v1/charge-notifications', {
+    chargeRequestIds: ids,
+    emails: destinos,
+    subject: '[Importante] Chegou sua fatura de BERTUZZI GESTAO PATRIMONIAL',
+    body: `Olá, ${opts.cliente || ''}.<br><br>Você acaba de receber ${grupos.length} cobrança` +
+      `${grupos.length > 1 ? 's' : ''} no valor total de R$ ${total.toFixed(2).replace('.', ',')}, ` +
+      `emitida por BERTUZZI GESTAO PATRIMONIAL. Confira os detalhes:<br>${linhas.join('<br>')}`,
+    replyTo: 'financeiro@bertuzzipatrimonial.com.br',
+    instantSending: true,
+    scheduled: false,
+    selfNotification: false,
+  });
+  const urls = ((r4.body?.chargeRequests) || []).map(c => c.url).filter(Boolean);
+  return { chargeRequestIds: ids, notificado: r4.status === 201, emails: destinos, urls };
+}
+
 async function createSetupSale(customerId, contract, opts) {
   if (USE_OFFICIAL_API || (opts && opts.useOfficial)) return createSetupSaleOficial(customerId, contract, opts);
   const valor = Number(contract.valorImplementacao);
@@ -1026,11 +1106,13 @@ async function createSetupSale(customerId, contract, opts) {
       serviceTaxTotal: tax.values.retained,
     },
     paymentCondition: {
-      paymentType: 'BANKING_BILLET',
+      paymentType: formaPagamento(contract).interna,
       financialAccountId: DEFAULTS.financialAccountId,
       paymentConditionOption: 'À vista',
       installments: [{ dueDate: vencimentoSetup(contract.dataAssinatura), value: tax.values.total }],
     },
+    ...(formaPagamento(contract).interna === 'PAYMENT_LINK'
+      ? { chargeRequestMetadata: { payment_link: { max_installments: 10 } } } : {}),
     observations: opts?.testMode ? 'TEST E2E CRM Setup — apagar' : `Setup ${contract.produto}`,
     invoiceObservations: '',
     situation: 'APPROVED',
@@ -1549,6 +1631,22 @@ async function scanAndProcessTest(opts = {}) {
             await logAudit(ctx, 'ca_setup', 'create', 'ok',
               `Criado setup avulso R$ ${setupAmount} (#${out.ca_setup?.number}) [fonte=${setupSource}]`,
               { ...(out.ca_setup || {}), source: setupSource }, tSetup);
+            // Emite a cobrança (boleto ou link, conforme o contrato) e manda pro cliente.
+            // Melhor-esforço: a venda já existe; se falhar, dá pra cobrar pela tela.
+            const tCob = Date.now();
+            try {
+              out.ca_cobranca = await gerarCobrancaVenda(out.ca_setup.id,
+                formaPagamento(c).cobranca,
+                [c.emailFinanceiro || c.emailRepresentante || contact.email].filter(Boolean),
+                { numero: out.ca_setup.number, cliente: c.razaoSocial });
+              await logAudit(ctx, 'ca_cobranca', 'create', 'ok',
+                `Cobrança do setup emitida (${formaPagamento(c).cobranca}) e enviada`,
+                out.ca_cobranca, tCob);
+            } catch (e) {
+              out.ca_cobranca_error = e.message;
+              await logAudit(ctx, 'ca_cobranca', 'create', 'error',
+                `Setup #${out.ca_setup?.number} criado mas SEM cobrança: ${e.message}`, null, tCob);
+            }
           } else {
             // Não existe e autocreate desligado → mantém pendência (comportamento atual), mas auditável.
             out.ca_setup_pending = `Criar setup avulso R$ ${setupAmount} (SETUP_AUTOCREATE off — manual no painel CA Pro) [fonte=${setupSource}]`;
@@ -1611,7 +1709,7 @@ async function scanAndProcessTest(opts = {}) {
     // crmRequest NÃO lança em erro (devolve {status:400}), o `if` abaixo era falso e o bloco
     // inteiro era pulado — sem UMA linha de log. Resultado: a automação de aditivo nunca
     // processou nada entre 28/05 e 31/07/2026. Ver o upsell de R$997 do Pôr do Sol.
-    const aq = `?select=id,documentName,documentType,autentiqueDocumentId,status,dealId,updatedAt,deal:Deal(id,title,status,contracts:Contract(id,cnpj,razaoSocial,status,autentiqueSignedAt),organization:Organization(name,cnpj))&documentType=eq.aditivo&status=eq.signed&updatedAt=gte.${encodeURIComponent(sinceAdit)}&order=updatedAt.desc&limit=50`;
+    const aq = `?select=id,documentName,documentType,autentiqueDocumentId,status,dealId,updatedAt,deal:Deal(id,title,status,contracts:Contract(id,cnpj,razaoSocial,status,autentiqueSignedAt,formaPagamento,emailFinanceiro),organization:Organization(name,cnpj))&documentType=eq.aditivo&status=eq.signed&updatedAt=gte.${encodeURIComponent(sinceAdit)}&order=updatedAt.desc&limit=50`;
     const ar = await crmRequest('GET', '/SentDocument' + aq);
     if (ar.status !== 200 || !Array.isArray(ar.body)) {
       // Falha de query NÃO pode mais passar em silêncio — foi assim que ficamos 2 meses cegos.
@@ -1703,15 +1801,30 @@ async function scanAndProcessTest(opts = {}) {
                   `Setup R$${dp.setupTotal} já existe na CA (#${existingSetup.number})`,
                   { id: existingSetup.id }, tSetup);
               } else if (SETUP_AUTOCREATE) {
+                // Forma de pagamento e e-mail de cobrança saem do CONTRATO do deal.
                 aOut.ca_setup = await createSetupSale(customerId, {
                   produto: dp.primaryProductName || a.deal?.title || '',
                   valorImplementacao: dp.setupTotal,
                   dataAssinatura: a.updatedAt || new Date().toISOString(),
                   sellerEmail: null,
+                  formaPagamento: doContrato?.formaPagamento,
                 }, { testMode: false });
                 await logAudit(ctxA, 'aditivo_setup', 'create', 'ok',
                   `Setup R$${dp.setupTotal} criado via aditivo (#${aOut.ca_setup?.number})`,
                   aOut.ca_setup, tSetup);
+                const tCobA = Date.now();
+                try {
+                  aOut.ca_cobranca = await gerarCobrancaVenda(aOut.ca_setup.id,
+                    formaPagamento({ formaPagamento: doContrato?.formaPagamento }).cobranca,
+                    [doContrato?.emailFinanceiro].filter(Boolean),
+                    { numero: aOut.ca_setup.number, cliente: doContrato?.razaoSocial });
+                  await logAudit(ctxA, 'aditivo_cobranca', 'create', 'ok',
+                    'Cobrança do setup do aditivo emitida e enviada', aOut.ca_cobranca, tCobA);
+                } catch (e) {
+                  aOut.ca_cobranca_error = e.message;
+                  await logAudit(ctxA, 'aditivo_cobranca', 'create', 'error',
+                    `Setup #${aOut.ca_setup?.number} criado mas SEM cobrança: ${e.message}`, null, tCobA);
+                }
               } else {
                 aOut.ca_setup_pending = `Criar setup R$${dp.setupTotal} (SETUP_AUTOCREATE off)`;
                 await logAudit(ctxA, 'aditivo_setup', 'skip', 'pending',
