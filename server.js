@@ -583,6 +583,102 @@ function normalizeProductKey(s) {
 }
 
 // Upsell: PUT no scheduled-sale com novo valor e/ou nova categoria/CC
+// Corrige o autoTasks de um contrato que JÁ EXISTE, preservando todo o resto.
+//
+// RECEITA (validada no contrato 562 em 31/07/2026, depois de um HAR da tela). Faltando
+// qualquer um destes quatro, a CA responde 400 ou 500 — e por isso eu tinha concluído,
+// errado, que só dava pra corrigir pela tela:
+//   1. `saleItems` com o **`saleItemId`** de cada item (o id do item que já existe; sem ele → 500)
+//   2. `saleId` no primeiro nível
+//   3. `serviceTaxInformation` inteiro + `valueComposition.serviceTaxTotal`
+//      (⚠️ sem eles a retenção ZERA e a parcela passa a cobrar o bruto — o bug das 99 parcelas)
+//   4. `emissionDate` = a PRÓXIMA competência, que o GET do contrato **não devolve**:
+//      vem do `/summary` como `nextEmissionDate`. Mandar null → 500.
+// E o `terms` vai SEM `startDate`.
+async function corrigirAutoTasks(schedId, novoAutoTasks) {
+  const cur = await caRequest('GET', `/app/v1/scheduled-sales/${schedId}`);
+  if (cur.status !== 200 || !cur.body) throw new Error(`GET scheduled-sale ${schedId}: ${cur.status}`);
+  const s = cur.body;
+  const sm = await caRequest('GET', `/app/v1/scheduled-sales/${schedId}/summary`);
+  const emissionDate = sm.body?.nextEmissionDate;
+  if (!emissionDate) throw new Error(`contrato ${schedId} sem nextEmissionDate — não dá pra fazer PUT`);
+  if (!s.saleId) throw new Error(`contrato ${schedId} sem saleId`);
+  const itr = await caRequest('GET', `/search-engine-core/v1/sales/${s.saleId}/items?page=1&page_size=20`);
+  const itens = (itr.body?.items || []).map(i => ({
+    description: i.description || '', amount: i.amount, value: i.value, id: i.id,
+    saleItemId: i.saleItemId, costValue: i.costValue || 0, priceAdjustmentMethod: null,
+  }));
+  if (!itens.length || itens.some(i => !i.saleItemId)) {
+    throw new Error(`contrato ${schedId}: itens sem saleItemId — PUT quebraria`);
+  }
+  const retido = (s.serviceTaxInformation?.values?.retained) ?? 0;
+  const terms = { ...(s.terms || {}) };
+  delete terms.startDate;
+  const body = {
+    autoTasks: novoAutoTasks,
+    categoryId: s.categoryId, chargeRequestMetadata: s.chargeRequestMetadata,
+    costCenterBySale: s.costCenterBySale, costCenterId: s.costCenterId,
+    customerId: s.customerId, emissionDate,
+    invoiceObservations: s.invoiceObservations || '', observations: s.observations || '',
+    ownerId: s.ownerId, paymentCondition: s.paymentCondition, saleId: s.saleId,
+    saleItems: itens, serviceProviderLocationId: s.serviceProviderLocationId || DEFAULTS.cityId,
+    serviceTaxInformation: s.serviceTaxInformation,
+    terms,
+    valueComposition: { shipping: 0, discount: { type: 'VALUE', value: 0 }, serviceTaxTotal: retido },
+    version: s.version || 0,
+  };
+  const r = await caRequest('PUT', `/app/v1/scheduled-sales/${schedId}`, body);
+  if (r.status !== 200) {
+    throw new Error(`PUT autoTasks ${schedId}: ${r.status} ${JSON.stringify(r.body).slice(0, 200)}`);
+  }
+  const dep = await caRequest('GET', `/app/v1/scheduled-sales/${schedId}`);
+  const novoRetido = dep.body?.serviceTaxInformation?.values?.retained;
+  if (Math.abs(Number(novoRetido || 0) - Number(retido || 0)) > 0.01) {
+    console.error(`[autotasks] ⚠️ ${schedId}: retenção mudou de ${retido} para ${novoRetido} — CONFERIR`);
+  }
+  return { autoTasks: dep.body?.autoTasks, retencao_preservada: Number(novoRetido) === Number(retido) };
+}
+
+// Lê o contrato recém-criado e conserta o que a CA não gravou como mandamos. O POST aceita o
+// payload inteiro mas nem tudo "pega": já vimos o gatilho da NFS-e sair diferente do enviado.
+// Melhor-esforço — o contrato já existe; se a correção falhar, fica o log.
+async function conferirContratoNovo(schedId, emailsEsperados) {
+  const r = await caRequest('GET', `/app/v1/scheduled-sales/${schedId}`);
+  const a = r.body?.autoTasks || {};
+  const si = a.serviceInvoice || {};
+  const emails = a.emailsReceiveInvoice || [];
+  const divergencias = [];
+  if (si.active !== true) divergencias.push(`NFS-e desligada (active=${si.active})`);
+  if (si.triggerType !== 'SALE_GENERATION') divergencias.push(`gatilho ${si.triggerType}`);
+  if (a.sendInvoice !== true) divergencias.push(`sendInvoice=${a.sendInvoice}`);
+  if (a.issueAndSendBilling !== true) divergencias.push(`issueAndSendBilling=${a.issueAndSendBilling}`);
+  if (emailsEsperados?.length && !emails.length) divergencias.push('sem e-mail de cobrança');
+  if (!divergencias.length) return { ok: true, corrigido: false };
+  console.log(`[contrato] ${schedId} nasceu divergente (${divergencias.join('; ')}) — corrigindo`);
+  const alvo = {
+    ...a,
+    sendInvoice: true,
+    issueAndSendBilling: true,
+    emailsReceiveInvoice: emails.length ? emails : (emailsEsperados || []),
+    serviceInvoice: { active: true, triggerType: 'SALE_GENERATION' },
+  };
+  const fix = await corrigirAutoTasks(schedId, alvo);
+  // ⚠️ A CA DESCARTA EM SILÊNCIO `sendInvoice` e `emailsReceiveInvoice` quando o e-mail é
+  // inválido: devolve 200, grava o resto e ignora esses dois. Medido em 31/07/2026 — com
+  // `@teste.invalid` o flag não pegou; com um domínio real, pegou. Então não basta o 200:
+  // confere de novo e grita, senão o contrato fica cobrando sem avisar ninguém.
+  const dep = fix.autoTasks || {};
+  const sobrou = [];
+  if (dep.sendInvoice !== true) sobrou.push('sendInvoice continua false');
+  if ((dep.serviceInvoice || {}).triggerType !== 'SALE_GENERATION') sobrou.push('gatilho não mudou');
+  if (!(dep.emailsReceiveInvoice || []).length) sobrou.push('continua sem e-mail de cobrança');
+  if (sobrou.length) {
+    console.error(`[contrato] ⚠️ ${schedId}: a CA RECUSOU ${sobrou.join('; ')} — ` +
+      `e-mail inválido? (enviado: ${JSON.stringify(alvo.emailsReceiveInvoice)}). Corrigir na tela.`);
+  }
+  return { ok: !sobrou.length, corrigido: true, divergencias, pendente: sobrou, resultado: fix };
+}
+
 async function updateScheduledSaleForUpsell(schedId, customerId, productKey, valorMensal, dueDay, searchTerm = '') {
   const map = PRODUCT_MAP[productKey];
   if (!map) throw new Error(`Produto desconhecido pra upsell: '${productKey}'`);
@@ -597,9 +693,13 @@ async function updateScheduledSaleForUpsell(schedId, customerId, productKey, val
   const oldItems = itemsR.body?.items || [];
   // Calcula novos taxes — respeitando o regime do tomador (Simples zera PIS+COFINS+CSLL)
   const tax = await calcTaxes(valorMensal, (await getSimplesFlag(customerId)) === true);
-  // emissionDate = dia 1 do próximo mês (assim novas parcelas usam novo valor)
+  // emissionDate: a CA valida a competência contra a própria cadência do contrato e devolve 500
+  // se vier outra coisa. A fonte certa é o `/summary` (`nextEmissionDate`) — o GET do contrato
+  // NÃO devolve esse campo. Só cai no cálculo (dia 1 do mês seguinte) se o summary falhar.
   const today = new Date();
-  const nextMonthFirst = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth() + 1, 1)).toISOString().slice(0, 10);
+  const smU = await caRequest('GET', `/app/v1/scheduled-sales/${schedId}/summary`);
+  const nextMonthFirst = smU.body?.nextEmissionDate
+    || new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth() + 1, 1)).toISOString().slice(0, 10);
   const firstDueDate = (() => {
     const d = new Date(nextMonthFirst);
     if (d.getUTCDate() > dueDay) d.setUTCMonth(d.getUTCMonth() + 1);
@@ -998,7 +1098,15 @@ async function createScheduledSale(customerId, contract, opts) {
   if (r.status !== 200 || !r.body?.id) {
     throw new Error(`createScheduledSale falhou ${r.status}: ${JSON.stringify(r.body).slice(0,600)}`);
   }
-  return { id: r.body.id, legacyId: r.body.legacyId, number: nextNum, emissionDate, firstDueDate };
+  const criado = { id: r.body.id, legacyId: r.body.legacyId, number: nextNum, emissionDate, firstDueDate };
+  // Confere o que a CA REALMENTE gravou e corrige se divergir do que mandamos.
+  try {
+    criado.conferencia = await conferirContratoNovo(criado.id, body.autoTasks.emailsReceiveInvoice);
+  } catch (e) {
+    criado.conferencia = { ok: false, erro: e.message };
+    console.error(`[contrato] ${criado.id} nasceu divergente e a correção falhou: ${e.message}`);
+  }
+  return criado;
 }
 
 // ---------- COBRANÇA (boleto / link de pagamento) ----------
