@@ -1682,7 +1682,15 @@ async function scanAndProcessTest(opts = {}) {
           }
           const customerId = customer.id || customer.uuid;
           aOut.ca_customer_id = customerId;
-          const searchTerm = a.deal?.organization?.name || ctxA.client_name;
+          // ⚠️ O searchTerm é o que a idempotência do setup usa pra achar a avulsa que já existe
+          // (findSetupSaleByCustomer busca vendas por NOME e depois filtra por cliente). Com o
+          // nome da organização do deal isso quebra: os deals de upsell vivem em organizações
+          // chamadas "-", a busca volta vazia e o pipeline cria uma venda avulsa DUPLICADA — que
+          // a CA não deixa apagar pela API. Razão social do contrato primeiro, sempre.
+          const nomeOrg = String(a.deal?.organization?.name || '').trim();
+          const searchTerm = doContrato?.razaoSocial
+            || (nomeOrg.length > 2 ? nomeOrg : '')
+            || ctxA.client_name;
 
           // 6a) Setup (avulsa) — mesma idempotência + gate do fluxo Contract
           if (dp.setupTotal > 0) {
