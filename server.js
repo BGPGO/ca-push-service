@@ -74,6 +74,9 @@ const PRODUCT_MAP = {
   // GO BI by AiMO — receita atribuída a GO AIMO (cc + categoria), decisão Thomas 17/06
   'go-bi-by-aimo': { cc: 'ac220d00-2160-11f1-977a-2ba7c1fffab6', cat: 'a66f45bf-8600-4640-9a97-ebe9f4b63e29' },
   'gestao-condominial': { cc: '4dc1ef9e-3b26-11f0-ac84-4f62813feeba', cat: 'd3464540-e64c-4494-9025-99ff5c7d001e' },
+  // LLM (upsell avulso) — receita atribuída a BI, independente do produto do cliente.
+  // Decisão Thomas 31/07/2026, alinhada com o LLM do Pôr do Sol (venda 4559).
+  'llm': { cc: '3b5f86a0-d9b0-11ee-a7fd-579af0a23ded', cat: 'b4387188-29c7-4906-9345-35bf7b66f515' },
 };
 
 // Mapeamento email vendedor -> ID na CA
@@ -2129,6 +2132,61 @@ ${runs.length === 0 ? '<p class="muted">Nenhum evento. Tabela bgp_pipeline_audit
     if (!cnpj) return send(400, { error: 'cnpj query required' });
     const found = await findCustomerByCnpj(cnpj);
     return send(200, { found: !!found, customer: found });
+  }
+
+  // Força a subida de UM aditivo cujo dado no CRM está incompleto (tipicamente o deal sem
+  // contrato, então sem CNPJ, e a trava barra). Roda exatamente o mesmo caminho do pipeline —
+  // createSetupSale + gerarCobrancaVenda — só que com o CNPJ vindo do corpo da requisição.
+  // NÃO cria cliente e NÃO toca na recorrência: aditivo é de cliente que já existe. (O
+  // /push-contract não serve aqui porque sempre chama createScheduledSale, o que duplicaria
+  // o contrato recorrente do cliente.)
+  if (req.method === 'POST' && u.pathname === '/push-aditivo') {
+    let body = '';
+    for await (const c of req) body += c;
+    let input;
+    try { input = JSON.parse(body); } catch { return send(400, { error: 'invalid json' }); }
+    const out = { ok: false, started_at: new Date().toISOString() };
+    try {
+      const cnpj = cleanCnpj(input.cnpj);
+      if (!validaCnpj(cnpj)) return send(400, { error: `CNPJ inválido: '${input.cnpj}'` });
+      const valor = Number(input.valorImplementacao);
+      if (!(valor > 0)) return send(400, { error: 'valorImplementacao obrigatório' });
+
+      const cust = await findCustomerByCnpj(cnpj);
+      if (!cust) return send(404, { error: `cliente ${cnpj} não existe na Conta Azul` });
+      const customerId = cust.id || cust.uuid;
+      out.customer = { id: customerId, cnpj };
+
+      const termo = input.razaoSocial || cust.name || '';
+      const existente = await findSetupSaleByCustomer(customerId, valor, termo);
+      if (existente) {
+        out.ok = true;
+        out.setupSale = { id: existente.id, number: existente.number, reused: true };
+        out.note = 'venda avulsa desse valor já existe — nada criado';
+        return send(200, out);
+      }
+      const contrato = {
+        produto: input.produto,
+        valorImplementacao: valor,
+        dataAssinatura: input.dataAssinatura || new Date().toISOString(),
+        formaPagamento: input.formaPagamento,
+        sellerEmail: input.sellerEmail || null,
+      };
+      out.setupSale = await createSetupSale(customerId, contrato, {});
+      try {
+        out.cobranca = await gerarCobrancaVenda(out.setupSale.id, formaPagamento(contrato).cobranca,
+          [input.emailFinanceiro].filter(Boolean),
+          { numero: out.setupSale.number, cliente: termo });
+      } catch (e) {
+        out.cobranca_error = e.message;
+      }
+      out.ok = true;
+      out.finished_at = new Date().toISOString();
+      return send(200, out);
+    } catch (e) {
+      out.error = e.message;
+      return send(500, out);
+    }
   }
 
   if (req.method === 'POST' && u.pathname === '/push-contract') {
