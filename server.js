@@ -1065,7 +1065,14 @@ async function gerarCobrancaVenda(saleId, tipoCobranca, emails, opts = {}) {
 }
 
 async function createSetupSale(customerId, contract, opts) {
-  if (USE_OFFICIAL_API || (opts && opts.useOfficial)) return createSetupSaleOficial(customerId, contract, opts);
+  // Setup SEMPRE pela interna (env SETUP_VIA_INTERNAL, default 'true'), mesma decisão que já
+  // vale pra recorrência: só a interna aceita o flag de emissão da NFS-e. O
+  // `CriacaoVendaRequest` da v2 oficial NÃO tem campo de emissão (conferido no OpenAPI
+  // sales-apis-openapi.yaml) — venda criada por lá nasce com a config padrão da conta, que é
+  // emissão DESLIGADA, e a nota nunca sai. O cliente já existe nesse ponto do pipeline, então
+  // não se perde a validação de endereço da v2, que acontece na criação do cadastro.
+  const setupInternal = String(process.env.SETUP_VIA_INTERNAL || 'true') === 'true';
+  if (!setupInternal && (USE_OFFICIAL_API || (opts && opts.useOfficial))) return createSetupSaleOficial(customerId, contract, opts);
   const valor = Number(contract.valorImplementacao);
   if (!valor || valor <= 0) return null;
 
@@ -1116,6 +1123,12 @@ async function createSetupSale(customerId, contract, opts) {
     observations: opts?.testMode ? 'TEST E2E CRM Setup — apagar' : `Setup ${contract.produto}`,
     invoiceObservations: '',
     situation: 'APPROVED',
+    // NFS-e da venda avulsa: emite QUANDO O PAGAMENTO FOR IDENTIFICADO (na recorrência o
+    // gatilho é outro — lá é na geração da venda). ⚠️ O campo aqui é `automation
+    // .serviceInvoiceEmission {type, active}`; no contrato é `autoTasks.serviceInvoice
+    // {active, triggerType}`. São campos DIFERENTES: copiar um no outro não funciona, a chave
+    // é ignorada e a venda nasce com a emissão desligada. Comprovado na venda 4559 (31/07).
+    automation: { serviceInvoiceEmission: { type: 'PAYMENT_IDENTIFICATION', active: true } },
     serviceTaxInformation: {
       id: DEFAULTS.serviceIdNfse,
       values: tax.values,
